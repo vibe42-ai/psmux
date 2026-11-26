@@ -93,6 +93,10 @@ pub enum ChoiceKind {
     StatusJustify,
     /// tmux `options_table_status_position_list` (options-table.c:53-55 at 3.8).
     StatusPosition,
+    /// tmux `options_table_get_clipboard_list` (options-table.c:87 at 3.8).
+    GetClipboard,
+    /// tmux `options_table_clock_mode_style_list` (options-table.c:38-40 at 3.8).
+    ClockModeStyle,
 }
 
 /// The values tmux's CHOICE option `status-justify` takes.
@@ -133,13 +137,21 @@ impl ChoiceKind {
             // options_find_choice (options.c:1239-1255 at 3.8) compares with
             // strcmp, so the value must be one of the list as it is. The value
             // is stored as given and the client matches it the same way.
-            Self::StatusJustify | Self::StatusPosition => {
-                let choices = if self == Self::StatusJustify {
-                    STATUS_JUSTIFY_CHOICES
-                } else {
-                    STATUS_POSITION_CHOICES
+            Self::StatusJustify | Self::StatusPosition | Self::ClockModeStyle => {
+                let choices = match self {
+                    Self::StatusJustify => STATUS_JUSTIFY_CHOICES,
+                    Self::StatusPosition => STATUS_POSITION_CHOICES,
+                    _ => crate::clock_style::CHOICES,
                 };
                 if choices.contains(&value) {
+                    Ok(())
+                } else {
+                    Err(format!("unknown value: {}", value))
+                }
+            }
+            // options_find_choice compares with strcmp, as for status-justify.
+            Self::GetClipboard => {
+                if crate::clipboard_read::GET_CLIPBOARD_CHOICES.contains(&value) {
                     Ok(())
                 } else {
                     Err(format!("unknown value: {}", value))
@@ -179,7 +191,7 @@ impl ChoiceKind {
         match self {
             Self::Priority | Self::Unvalidated | Self::CopyModeLineNumbers
             | Self::ExtendedKeys | Self::ExtendedKeysFormat | Self::RemainOnExit | Self::Sixel
-            | Self::StatusJustify | Self::StatusPosition => true,
+            | Self::StatusJustify | Self::StatusPosition | Self::GetClipboard | Self::ClockModeStyle => true,
             Self::PaneBorderIndicators => false,
         }
     }
@@ -188,7 +200,7 @@ impl ChoiceKind {
         match self {
             Self::Priority | Self::Unvalidated | Self::CopyModeLineNumbers
             | Self::ExtendedKeys | Self::ExtendedKeysFormat | Self::RemainOnExit | Self::Sixel
-            | Self::StatusJustify | Self::StatusPosition => true,
+            | Self::StatusJustify | Self::StatusPosition | Self::GetClipboard | Self::ClockModeStyle => true,
             Self::PaneBorderIndicators => false,
         }
     }
@@ -206,6 +218,10 @@ pub enum OptionType {
     /// with `bad colour` when it is none (options.c:1332-1336 at 3.8). See
     /// [`crate::style::option_colour_name`] for the names taken.
     Colour,
+    /// A tmux OPTIONS_TABLE_STRING with OPTIONS_TABLE_IS_COLOUR
+    /// (cursor-colour): empty or a colour, refused with `invalid colour`
+    /// (options.c:1205-1208 at 3.8), kept as written.
+    ColourString,
 }
 
 impl OptionType {
@@ -219,6 +235,7 @@ impl OptionType {
             Self::Colour => crate::style::option_colour_name(value)
                 .map(|_| ())
                 .ok_or_else(|| format!("bad colour: {}", value)),
+            Self::ColourString => crate::cursor_colour::validate(value),
             Self::String | Self::Boolean => Ok(()),
         }
     }
@@ -228,14 +245,14 @@ impl OptionType {
     const fn allows_append(self) -> bool {
         match self {
             Self::Choice(kind) => kind.allows_append(),
-            Self::String | Self::Boolean | Self::Number(_) | Self::Key | Self::Colour => true,
+            Self::String | Self::Boolean | Self::Number(_) | Self::Key | Self::Colour | Self::ColourString => true,
         }
     }
 
     const fn allows_local_window_override(self) -> bool {
         match self {
             Self::Choice(kind) => kind.allows_local_window_override(),
-            Self::String | Self::Boolean | Self::Number(_) | Self::Key | Self::Colour => true,
+            Self::String | Self::Boolean | Self::Number(_) | Self::Key | Self::Colour | Self::ColourString => true,
         }
     }
 }
@@ -285,7 +302,7 @@ impl ValidationOnlyOptionDef {
     }
 }
 
-use ChoiceKind::{Priority, StatusJustify, StatusPosition, Unvalidated};
+use ChoiceKind::{GetClipboard, Priority, StatusJustify, StatusPosition, Unvalidated};
 use NumberKind::{I64, Index, InputBufferSize, RepeatTime, StatusLength, U64, Usize};
 use OptionScope::{Pane, Server, Session, Window};
 use OptionType::{Boolean, Choice, Number};
@@ -301,6 +318,7 @@ pub static OPTION_CATALOG: &[OptionDef] = &[
     OptionDef { name: "history-limit", scope: Server, option_type: Number(Usize), default: "2000", description: "Maximum scrollback lines per pane" },
     OptionDef { name: "alternate-screen", scope: Server, option_type: Boolean, default: "on", description: "Honour DEC 47/1049 alt-screen mode (off = TUI output goes to scrollback, #88)" },
     OptionDef { name: "set-clipboard", scope: Server, option_type: UNVALIDATED_CHOICE, default: "external", description: "OSC 52 clipboard integration" },
+    OptionDef { name: "get-clipboard", scope: Server, option_type: Choice(GetClipboard), default: "buffer", description: "What a pane's OSC 52 clipboard query is answered with (off/buffer/request/both)" },
     OptionDef { name: "default-shell", scope: Server, option_type: OptionType::String, default: "", description: "Default shell for new panes" },
     OptionDef { name: "default-terminal", scope: Server, option_type: OptionType::String, default: "xterm-256color", description: "TERM value for new panes" },
     OptionDef { name: "copy-command", scope: Server, option_type: OptionType::String, default: "", description: "External copy command (pipe selection)" },
@@ -308,8 +326,8 @@ pub static OPTION_CATALOG: &[OptionDef] = &[
     // The default array (option_array::ARRAY_OPTIONS, tmux 3.8's
     // options-table.c:553-563) as `#{terminal-features}` reads it, the
     // elements joined with a space.
-    OptionDef { name: "terminal-features", scope: Server, option_type: OptionType::String, default: "xterm*:clipboard:ccolour:cstyle:focus:title screen*:title rxvt*:ignorefkeys", description: "Array of pattern:feature entries, kept as tmux keeps them (comma separated, or one element with terminal-features[N]); psmux takes a client's features from the client at attach, not from this" },
-    OptionDef { name: "terminal-overrides", scope: Server, option_type: OptionType::String, default: "linux*:AX@", description: "Array of pattern:cap overrides matched against the client TERM; smcup@/rmcup@ keep the attached client off the host's alternate screen (#700)" },
+    OptionDef { name: "terminal-features", scope: Server, option_type: OptionType::String, default: "xterm*:clipboard:ccolour:cstyle:focus:title screen*:title rxvt*:ignorefkeys *:progressbar", description: "Array of pattern:feature entries, kept as tmux keeps them (comma separated, or one element with terminal-features[N]); progressbar decides whether a client writes the progress indicator, and psmux takes a client's other features from the client at attach" },
+    OptionDef { name: "terminal-overrides", scope: Server, option_type: OptionType::String, default: "linux*:AX@", description: "Array of pattern:cap overrides matched against the client TERM; smcup@/rmcup@ keep the attached client off the host's alternate screen (#700), and Spb sets or with Spb@ removes what it writes for the progress indicator" },
     // The default array (option_array::ARRAY_OPTIONS) as `#{command-alias}`
     // reads it, the elements joined with a space.
     OptionDef { name: "command-alias", scope: Server, option_type: OptionType::String, default: "split-pane=split-window splitp=split-window server-info=show-messages -JT info=show-messages -JT choose-window=choose-tree -w choose-session=choose-tree -s", description: "Array of command aliases, each name=command; set one element with command-alias[N]" },
@@ -411,6 +429,15 @@ pub static OPTION_CATALOG: &[OptionDef] = &[
     // tmux options-table.c:1699-1721, window and pane scope.
     OptionDef { name: "remain-on-exit", scope: Window, option_type: Choice(ChoiceKind::RemainOnExit), default: "off", description: "Whether a pane stays after its program exits: off, on, failed (only for a nonzero status), key (until a key is typed in it) or failed-key (a failed exit, until a key is typed in it)" },
     OptionDef { name: "remain-on-exit-format", scope: Window, option_type: OptionType::String, default: REMAIN_ON_EXIT_FORMAT_DEFAULT, description: "Text written on the bottom line of a pane remain-on-exit kept" },
+    // tmux options-table.c:1723, window and pane scope.
+    OptionDef { name: "scroll-on-clear", scope: Window, option_type: Boolean, default: "on", description: "Whether clearing the whole screen sends what it showed to history first" },
+    // tmux options-table.c:354, window and pane scope, a string that has to
+    // be a colour (OPTIONS_TABLE_IS_COLOUR).
+    OptionDef { name: "cursor-colour", scope: Window, option_type: OptionType::ColourString, default: "", description: "Colour of the cursor, under the one a program sets with OSC 12; empty for the terminal's own" },
+    // tmux options-table.c:1330, window scope, default `24`. psmux keeps the
+    // format its clock always had, `24-with-seconds`. Stored as text in
+    // user_options and window_options; crate::clock_style reads it.
+    OptionDef { name: "clock-mode-style", scope: Window, option_type: Choice(ChoiceKind::ClockModeStyle), default: crate::clock_style::DEFAULT_NAME, description: "Time format of the clock in clock mode (12/24/12-with-seconds/24-with-seconds)" },
     OptionDef { name: "aggressive-resize", scope: Window, option_type: Boolean, default: "off", description: "Resize window to smallest attached client" },
     // tmux types both of these OPTIONS_TABLE_STRING (options-table.c:1474) and
     // documents a percentage form ("10%"), so they cannot be validated as a
@@ -647,6 +674,10 @@ pub static WINDOW_OPTION_NAMES: &[&str] = &[
     // A window option in tmux (options-table.c:1694): `set -w -t <window>`
     // keeps it on that window, and `show -w` lists it there.
     "remain-on-exit-format",
+    "scroll-on-clear",
+    "cursor-colour",
+    // A window option in tmux (options-table.c:1330).
+    "clock-mode-style",
     "window-status-format",
     "window-status-current-format",
     "window-status-separator",

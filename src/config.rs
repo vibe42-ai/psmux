@@ -1703,6 +1703,50 @@ fn tokens_with_offsets(line: &str) -> Vec<(usize, String)> {
     out
 }
 
+/// A `set-option` line that sets `user-keys` (one element or the whole
+/// array), with the value read with tmux's escapes and written back quoted
+/// for psmux's own lexer, so `parse_command_line` hands the setter the bytes
+/// tmux's parser would (cmd-parse.y:1701-1705 and :1478 at tag 3.8, where
+/// `\e` is ESC). None for any other line, which then stays as it was.
+///
+/// The config file reads such a value in [`parse_set_option`]. The command
+/// prompt and a key binding reach the server as text on the client's
+/// connection, and a hook line that names another session reaches that
+/// session as text too, where the value was read with psmux's lexer, which
+/// keeps `\e` as two characters for the sake of Windows paths (#1014). A
+/// line typed on the shell's command line does not come through here: tmux
+/// takes those arguments as they are.
+pub(crate) fn user_keys_line_tmux_read(line: &str) -> Option<String> {
+    let toks = tokens_with_offsets(line);
+    if !matches!(toks.first()?.1.as_str(), "set-option" | "set") {
+        return None;
+    }
+    // The flags as parse_set_option reads them: a word with `t` takes the
+    // target after it.
+    let mut i = 1;
+    while i < toks.len() {
+        let p = toks[i].1.as_str();
+        if !p.starts_with('-') || p.len() < 2 {
+            break;
+        }
+        i += 1;
+        if p == "--" {
+            break;
+        }
+        if p.contains('t') {
+            i += 1;
+        }
+    }
+    let name = strip_wrapping_quotes(&toks.get(i)?.1);
+    if !crate::option_array::is_array_name(name).is_some_and(|spec| spec.name == crate::user_keys::OPTION) {
+        return None;
+    }
+    let (off, raw) = toks.get(i + 1)?;
+    let value = crate::commands::tmux_escaped_word(&line[*off..]);
+    let end = off + raw.len();
+    Some(format!("{}{}{}", &line[..*off], crate::util::quote_arg_for_handler(&value), &line[end..]))
+}
+
 /// Resolve a `set-option` value from the remainder of a config line.
 ///
 /// A value wrapped in matching quotes that close at end of line is taken
@@ -2442,7 +2486,12 @@ pub fn parse_option_value(app: &mut AppState, key: &str, value: &str, _is_global
             if let Ok(n) = value.parse::<usize>() { app.status_right_length = n; }
         }
         "window-size" => { app.window_size = value.to_string(); }
-        "allow-passthrough" => { app.allow_passthrough = value.to_string(); }
+        "allow-passthrough" => {
+            app.allow_passthrough = value.to_string();
+            // Every pane parser reads it from the next DCS on, so a change
+            // applies to panes that already exist.
+            vt100::set_allow_passthrough(matches!(value, "on" | "all"));
+        }
         "copy-command" => { app.copy_command = value.to_string(); }
         "set-clipboard" => { app.set_clipboard = value.to_string(); }
         "env-shim" => {
@@ -3915,7 +3964,7 @@ pub fn parse_key_string(key: &str) -> Option<(KeyCode, KeyModifiers)> {
             KeyCode::Char(key_part.chars().next().unwrap())
         }
         "space" => KeyCode::Char(' '),
-        "enter" | "return" => KeyCode::Enter,
+        "enter" | "return" | "cr" => KeyCode::Enter,
         "tab" => KeyCode::Tab,
         "btab" | "backtab" => KeyCode::BackTab,
         "escape" | "esc" => KeyCode::Esc,
@@ -4924,3 +4973,7 @@ mod tests_issue734_followup_queue;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue823_quote_escapes.rs"]
 mod test_issue823_quote_escapes;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue1014_user_keys_lines.rs"]
+mod test_issue1014_user_keys_lines;

@@ -40,13 +40,17 @@ fn an_index_past_sixteen_set_by_osc_4_is_a_query() {
 }
 
 #[test]
-fn an_index_past_sixteen_with_no_entry_is_not() {
-    // tmux asks the outer terminal for it; psmux does not yet.
+fn an_index_past_sixteen_with_no_entry_is_a_query_with_no_entry() {
+    // The host answers it from the xterm 256 colour table; tmux asks the
+    // outer terminal (input_add_request, input.c:2956).
     let mut p = live();
-    assert!(queries(&mut p, b"\x1b]4;16;?\x07\x1b]4;20;?\x1b\\\x1b]4;255;?\x07").is_empty());
+    assert_eq!(
+        queries(&mut p, b"\x1b]4;16;?\x07\x1b]4;20;?\x1b\\\x1b]4;255;?\x07"),
+        vec![palette(16, None, true), palette(20, None, false), palette(255, None, true)]
+    );
     // Reset with OSC 104, it has none again.
     queries(&mut p, b"\x1b]4;20;rgb:11/22/33\x07\x1b]104;20\x07");
-    assert!(queries(&mut p, b"\x1b]4;20;?\x07").is_empty());
+    assert_eq!(queries(&mut p, b"\x1b]4;20;?\x07"), vec![palette(20, None, true)]);
 }
 
 #[test]
@@ -68,7 +72,12 @@ fn the_pairs_of_one_osc_4_mix_the_low_and_high_indexes_in_order() {
     let mut p = live();
     assert_eq!(
         queries(&mut p, b"\x1b]4;20;rgb:11/22/33;1;?;20;?;21;?;2;?\x1b\\"),
-        vec![palette(1, None, false), palette(20, Some((0x11, 0x22, 0x33)), false), palette(2, None, false)]
+        vec![
+            palette(1, None, false),
+            palette(20, Some((0x11, 0x22, 0x33)), false),
+            palette(21, None, false),
+            palette(2, None, false),
+        ]
     );
 }
 
@@ -78,10 +87,10 @@ fn a_colour_query_keeps_how_it_ended() {
     assert_eq!(
         queries(&mut p, b"\x1b]10;?\x07\x1b]10;?\x1b\\\x1b]11;?\x07\x1b]11;?\x1b\\\x1b]4;1;?\x07\x1b]4;1;?\x1b\\"),
         vec![
-            TerminalQuery::ForegroundColour { bel: true },
-            TerminalQuery::ForegroundColour { bel: false },
-            TerminalQuery::BackgroundColour { bel: true },
-            TerminalQuery::BackgroundColour { bel: false },
+            TerminalQuery::ForegroundColour { colour: None, bel: true },
+            TerminalQuery::ForegroundColour { colour: None, bel: false },
+            TerminalQuery::BackgroundColour { colour: None, bel: true },
+            TerminalQuery::BackgroundColour { colour: None, bel: false },
             palette(1, None, true),
             palette(1, None, false),
         ]

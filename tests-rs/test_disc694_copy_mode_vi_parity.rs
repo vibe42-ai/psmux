@@ -319,18 +319,18 @@ fn render_copy_leaf_hl(sel: Option<((u16, u16), (u16, u16))>, cursor: (u16, u16)
     let cell = |ch: char| CellJson {
         text: ch.to_string(), fg: String::new(), bg: String::new(),
         bold: false, italic: false, underline: false, inverse: false,
-        dim: false, blink: false, hidden: false, strikethrough: false, overline: false,
+        dim: false, blink: false, hidden: false, strikethrough: false, overline: false, link: None,
     };
     let content: Vec<Vec<CellJson>> = (0..h).map(|_| (0..w).map(|_| cell('x')).collect()).collect();
     let leaf = LayoutJson::Leaf {
         id: 0, rows: h, cols: w, cursor_row: 0, cursor_col: 0,
-        alternate_screen: false, wants_mouse: false, hide_cursor: true, cursor_shape: 0,
+        alternate_screen: false, wants_mouse: false, hide_cursor: true, cursor_shape: 0, cursor_colour: None, default_colours: None,
         active: true, copy_mode: true, scroll_offset: 0, view_offset: 0,
         sel_start_row: sel.map(|s| s.0 .0), sel_start_col: sel.map(|s| s.0 .1),
         sel_end_row: sel.map(|s| s.1 .0), sel_end_col: sel.map(|s| s.1 .1),
         sel_mode: sel.map(|_| "char".to_string()),
         copy_cursor_row: Some(cursor.0), copy_cursor_col: Some(cursor.1),
-        content, rows_v2: Vec::new(), title: None, copy_hl: hl, images: vec![],
+        content, rows_v2: Vec::new(), title: None, clock: false, copy_hl: hl, images: vec![],
     };
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
     term.draw(|f| {

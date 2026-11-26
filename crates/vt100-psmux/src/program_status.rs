@@ -326,18 +326,43 @@ pub enum TerminalQuery {
     Xtversion,
     /// Light or dark colour scheme (`CSI ? 996 n`).
     ColourScheme,
+    /// XTSMGRAPHICS (`CSI ? item ; action ; value S`). A missing parameter is
+    /// 0 and one holding a colon -1, as tmux's `input_get` reads them.
+    GraphicsAttribute {
+        /// 1 is the colour registers, 2 the sixel geometry, 3 the `ReGIS` geometry.
+        item: i32,
+        /// 1 reads, 2 resets, 3 sets, 4 reads the maximum.
+        action: i32,
+        /// The value for a set.
+        value: i32,
+    },
     /// Default foreground colour (`OSC 10 ; ?`).
     ForegroundColour {
+        /// The pane's own colour when the query was met, its styles' and the
+        /// program's (`Screen::default_foreground`). `None` leaves the reply
+        /// to the outer terminal's colour, as tmux's `window_pane_get_fg`
+        /// does (window.c:2758 at tag 3.8).
+        colour: Option<(u8, u8, u8)>,
         /// The query ended in BEL, not ST. See [`TerminalQuery::PaletteColour`].
         bel: bool,
     },
     /// Default background colour (`OSC 11 ; ?`).
     BackgroundColour {
+        /// As [`TerminalQuery::ForegroundColour`]'s.
+        colour: Option<(u8, u8, u8)>,
         /// The query ended in BEL, not ST. See [`TerminalQuery::PaletteColour`].
         bel: bool,
     },
-    /// A palette colour (an `index ; ?` pair of an `OSC 4`): one of the
-    /// sixteen ANSI colours, or any index the pane has its own entry for.
+    /// Cursor colour (`OSC 12 ; ?`).
+    CursorColour {
+        /// The colour when the query was met: the program's, then the
+        /// `cursor-colour` default. `None` gets no reply, as in tmux
+        /// (`input_osc_12`, input.c:3164 at tag 3.8).
+        colour: Option<(u8, u8, u8)>,
+        /// The query ended in BEL, not ST. See [`TerminalQuery::PaletteColour`].
+        bel: bool,
+    },
+    /// A palette colour (an `index ; ?` pair of an `OSC 4`), any index.
     PaletteColour {
         /// The palette index asked for, 0 to 255.
         index: u8,
@@ -348,6 +373,16 @@ pub enum TerminalQuery {
         /// The query ended in BEL, not ST. tmux ends the reply the same way
         /// (`input_osc_colour_reply` takes `ictx->input_end`, input.c at tag
         /// 3.8).
+        bel: bool,
+    },
+    /// The clipboard (`OSC 52 ; selection ; ?`), answered from the paste
+    /// buffers or the system clipboard as the host's options say
+    /// (`input_osc_52_reply`, input.c:3341 at tag 3.8).
+    Clipboard {
+        /// The selection the reply names: the first of `cpqs01234567` the
+        /// query gave, or 0 for none.
+        selection: u8,
+        /// The query ended in BEL, not ST. See [`TerminalQuery::PaletteColour`].
         bel: bool,
     },
 }

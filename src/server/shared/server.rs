@@ -104,6 +104,154 @@ pub(crate) fn queued_starts() -> usize {
     HOOK_STARTS.with(|q| q.borrow().len())
 }
 
+thread_local! {
+    static OTHER_SESSION_LINES: std::cell::RefCell<Vec<(String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static PORTED_SESSIONS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static LOOP_GLOBALS: std::cell::RefCell<Option<Arc<Globals>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn queue_other_session_line(app: &AppState, parts: &[&str], cmd: &str) -> bool {
+    let crate::commands::OtherSessionDecision::Other {
+        name, key, line, ..
+    } = crate::commands::decide_other_session(app, parts, cmd)
+    else {
+        return false;
+    };
+    let direct = direct_run_line(&line, &name) && peer_known(&name, &key);
+    if !PORTED_SESSIONS.with(|ported| admit(&mut ported.borrow_mut(), &name, direct)) {
+        return false;
+    }
+    OTHER_SESSION_LINES.with(|q| q.borrow_mut().push((name, line)));
+    true
+}
+
+pub(crate) fn admit(ported: &mut Vec<String>, name: &str, direct: bool) -> bool {
+    if ported.iter().any(|session| session == name) {
+        return false;
+    }
+    if !direct {
+        ported.push(name.to_string());
+    }
+    direct
+}
+
+fn peer_known(name: &str, key: &str) -> bool {
+    let Some(globals) = LOOP_GLOBALS.with(|g| g.borrow().clone()) else {
+        return false;
+    };
+    let Ok(peers) = globals.peers.read() else {
+        return false;
+    };
+    peers.iter().any(|p| p.name == name && p.key == key)
+}
+
+pub(crate) fn direct_run_line(line: &str, name: &str) -> bool {
+    let words = crate::commands::parse_command_line(line);
+    if words.join(" ") != line || !words.iter().all(|word| plain_word(word)) {
+        return false;
+    }
+    let Some((command, rest)) = words.split_first() else {
+        return false;
+    };
+    if command != "set" && command != "set-option" {
+        return false;
+    }
+    let Some((unset, operands)) = session_set_operands(rest, &format!("{name}:")) else {
+        return false;
+    };
+    let Some(option_name) = operands.first().and_then(|option| option.strip_prefix('@')) else {
+        return false;
+    };
+    let named = !option_name.is_empty()
+        && option_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && option_name != "plugin";
+    let wanted = if unset { 1 } else { 2 };
+    named && operands.len() == wanted
+}
+
+fn plain_word(word: &str) -> bool {
+    !word.is_empty()
+        && !word
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '\'' | '"' | ';' | '\\' | '#'))
+}
+
+fn session_set_operands<'a>(words: &'a [String], target: &str) -> Option<(bool, Vec<&'a str>)> {
+    let mut targets = 0;
+    let mut unset = false;
+    let mut operands = Vec::new();
+    let mut words = words.iter().map(String::as_str);
+    while let Some(word) = words.next() {
+        if !word.starts_with('-') {
+            operands.push(word);
+            continue;
+        }
+        if !operands.is_empty() {
+            return None;
+        }
+        match word {
+            "-t" if words.next() == Some(target) => targets += 1,
+            "-q" => {}
+            "-u" => unset = true,
+            _ => return None,
+        }
+    }
+    (targets == 1).then_some((unset, operands))
+}
+
+fn drain_other_session_lines(
+    sessions: &mut BTreeMap<usize, Session>,
+    ended: &mut Vec<(usize, &'static str)>,
+    mut run: impl FnMut(&mut Session, &str) -> Flow,
+) {
+    PORTED_SESSIONS.with(|ported| ported.borrow_mut().clear());
+    let lines = OTHER_SESSION_LINES.with(|q| std::mem::take(&mut *q.borrow_mut()));
+    for (name, line) in lines {
+        let found = sessions
+            .iter_mut()
+            .find(|(sid, s)| s.app.session_name == name && !ended.iter().any(|(e, _)| e == *sid));
+        let Some((&sid, s)) = found else {
+            log_hook_start(&format!(
+                "a hook's line for session {name} dropped: the session is gone"
+            ));
+            continue;
+        };
+        if run(s, &line) == Flow::EndSession {
+            ended.push((sid, "panic"));
+        }
+    }
+}
+
+fn run_other_session_lines(
+    sessions: &mut BTreeMap<usize, Session>,
+    ended: &mut Vec<(usize, &'static str)>,
+    ids: &mut ServerIds,
+    bufs: &mut ServerBuffers,
+    ns: &Option<String>,
+) {
+    drain_other_session_lines(sessions, ended, |s, line| {
+        run_request(s, ids, bufs, ns, |app, lp| run_line(app, lp, line))
+    });
+}
+
+fn run_line(app: &mut AppState, lp: &mut SessionLoop, line: &str) -> io::Result<Flow> {
+    if router::first_unsupported_aliased(line, |name| alias_of(&lp.aliases, name)).is_some() {
+        return Ok(Flow::Continue);
+    }
+    let mut restore = lp.temp_focus_restore.take();
+    temp_target::restore_temp_focus(app, &mut restore);
+    lp.temp_focus_restore = restore;
+    let _ = crate::commands::execute_command_string(app, line);
+    lp.state_dirty = true;
+    lp.meta_dirty = true;
+    Ok(Flow::Continue)
+}
+
 pub(crate) fn prepare_hook_start(
     args: &mut NewSessionArgs,
     hook_cwd: Option<&std::path::Path>,
@@ -258,7 +406,8 @@ fn deliver(p: &Peer, line: &str) {
     let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = write!(s, "AUTH {}\n{}\n", p.key, line);
     let _ = s.flush();
-    let _ = s.shutdown(std::net::Shutdown::Write);
+    // No half-close: see NO CLIENT HALF-CLOSE in session.rs. The handler
+    // closes this one-shot connection once the command has run.
     let mut sink = [0u8; 4096];
     while let Ok(k) = io::Read::read(&mut s, &mut sink) {
         if k == 0 {
@@ -470,6 +619,7 @@ fn run(ns: Option<String>) -> ! {
         key: control_key.clone(),
     };
     let globals: Arc<Globals> = Arc::new(Globals::default());
+    LOOP_GLOBALS.with(|g| *g.borrow_mut() = Some(globals.clone()));
     {
         let tx = msg_tx.clone();
         let key = control_key.clone();
@@ -511,10 +661,26 @@ fn run(ns: Option<String>) -> ! {
                 if crate::pane_colours::reconcile(app) {
                     lp.state_dirty = true;
                 }
+                // scroll-on-clear: the same, and nothing to redraw.
+                crate::scroll_on_clear::reconcile(app);
+                // cursor-colour: the same; a new colour to draw goes out with
+                // a frame.
+                if crate::cursor_colour::reconcile(app) {
+                    lp.state_dirty = true;
+                }
+                // window-style and window-active-style, for the OSC 10 and
+                // OSC 11 replies.
+                crate::style_colours::reconcile(app);
+                // A pane's OSC 52 query, answered by the session that has
+                // the pane.
+                crate::clipboard_read::serve(app, crate::clipboard_read::has_pane);
             })
             .into_iter()
             .map(|sid| (sid, "panic")),
         );
+        crate::clipboard_read::drop_orphans(|id| {
+            sessions.values().any(|s| crate::clipboard_read::has_pane(&s.app, id))
+        });
         let data_ready = crate::types::PTY_DATA_READY.swap(false, Ordering::AcqRel);
         if data_ready {
             let cpr = crate::types::CPR_DATA_PENDING.swap(false, Ordering::AcqRel);
@@ -562,6 +728,7 @@ fn run(ns: Option<String>) -> ! {
             _ => 0,
         });
         for m in pending {
+            run_other_session_lines(&mut sessions, &mut ended, &mut ids, &mut bufs, &ns);
             match m {
                 Msg::Wake => crate::types::clear_wake_pending(),
                 Msg::Req(sid, req) => {
@@ -611,6 +778,7 @@ fn run(ns: Option<String>) -> ! {
                 }
             }
         }
+        run_other_session_lines(&mut sessions, &mut ended, &mut ids, &mut bufs, &ns);
         // Per session upkeep: alerts, reaping exited panes, the registry
         // self heal, frames for attached clients.
         let sids: Vec<usize> = sessions.keys().copied().collect();
@@ -624,6 +792,7 @@ fn run(ns: Option<String>) -> ! {
                 ended.push((sid, "exit-empty"));
             }
         }
+        run_other_session_lines(&mut sessions, &mut ended, &mut ids, &mut bufs, &ns);
         if run_hook_starts(
             &mut sessions,
             &mut ids,
@@ -635,6 +804,7 @@ fn run(ns: Option<String>) -> ! {
         ) {
             had_session = true;
         }
+        run_other_session_lines(&mut sessions, &mut ended, &mut ids, &mut bufs, &ns);
         for (sid, _why) in ended {
             if let Some(s) = sessions.remove(&sid) {
                 if let Ok(mut p) = globals.peers.write() {
@@ -796,6 +966,7 @@ fn enter(s: &mut Session, ids: &ServerIds, ns: &Option<String>) {
 /// One session's upkeep for one loop pass (copied from the tail of
 /// run_server's loop iteration, server/mod.rs at 0145958f).
 fn upkeep(app: &mut AppState, lp: &mut SessionLoop, pty_system: &dyn portable_pty::PtySystem) -> io::Result<Flow> {
+    helpers::drain_host_events(app);
     crate::format::set_sessionless(false);
     // copied from run_server (cc32087b): a set-option a hook or a key binding
     // ran in process already wrote its value; this is the rest of what the
@@ -1738,10 +1909,6 @@ fn refuse(stream: std::net::TcpStream, outcome: &Outcome, opening_lines: usize) 
     }
 }
 
-/// The control listener protocol, spoken only by the shared CLI:
-/// `AUTH <key>`, then `new-session` followed by `field=value` lines (values
-/// escaped by `router::encode_field`) and `end`, or `ping`. The reply is
-/// written by `reply::reply_text`.
 fn replay_globals(globals: &Globals, name: &str) {
     let peer = globals
         .peers
@@ -1756,6 +1923,10 @@ fn replay_globals(globals: &Globals, name: &str) {
     }
 }
 
+/// The control listener protocol, spoken only by the shared CLI:
+/// `AUTH <key>`, then `new-session` followed by `field=value` lines (values
+/// escaped by `router::encode_field`) and `end`, or `ping`. The reply is
+/// written by `reply::reply_text`.
 fn serve_control(stream: std::net::TcpStream, key: &str, tx: mpsc::Sender<Msg>, globals: &Globals) {
     use std::io::BufRead;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
@@ -1847,6 +2018,10 @@ mod tests_issue798_shared_server_requests;
 mod tests_issue894_897_shared_guards;
 
 #[cfg(test)]
+#[path = "../../../tests-rs/test_pr1047_push_live_title.rs"]
+mod test_pr1047_push_live_title;
+
+#[cfg(test)]
 #[path = "../../../tests-rs/test_issue897_shared_new_session_size.rs"]
 mod tests_issue897_shared_new_session_size;
 
@@ -1857,3 +2032,11 @@ mod tests_shared_confirm_before;
 #[cfg(test)]
 #[path = "../../../tests-rs/test_shared_dropped_requests.rs"]
 mod tests_shared_dropped_requests;
+
+#[cfg(test)]
+#[path = "../../../tests-rs/test_issue798_shared_direct_run.rs"]
+mod tests_issue798_shared_direct_run;
+
+#[cfg(all(test, windows))]
+#[path = "../../../tests-rs/test_enter_send_keys.rs"]
+mod tests_enter_send_keys;

@@ -136,6 +136,14 @@ pub struct Screen {
     /// entered, `None` while it is not in use (tmux's `saved_cx`/`saved_cy`,
     /// set by screen_alternate_on and reset by screen_alternate_off).
     alternate_saved_cursor: Option<(u16, u16)>,
+    /// Whether DECSET 1049 has saved the cursor that DECRST 1049 puts back,
+    /// tmux's `saved_cx != UINT_MAX`: set by 1049 on the way in and kept
+    /// after it (`screen_alternate_on` and `screen_alternate_off`, screen.c:707
+    /// and 746 at tag 3.8). 47 saves none. tmux keeps it through RIS too,
+    /// which only `screen_reinit` (screen.c:124) would reset; RIS here starts
+    /// the screen again and forgets it, as it forgets the DECSC slot it
+    /// lives in.
+    cursor_saved_by_1049: bool,
 
     modes: u8,
     mouse_protocol_mode: MouseProtocolMode,
@@ -186,6 +194,7 @@ pub struct Screen {
     /// so the client re-emits OSC 52 on its own stdout to reach the host
     /// terminal (Windows Terminal, etc.).
     osc52_clipboard: Option<(Vec<u8>, Vec<u8>)>,
+    pub(crate) host_events: crate::host_events::Events,
 
     /// OSC 8 hyperlink store.  URIs are interned here; a cell's `Attrs.link`
     /// is the index into this Vec plus 1 (0 = no link), mirroring tmux's
@@ -262,6 +271,25 @@ pub struct Screen {
     /// Copy-on-exit is the equivalent end-user behaviour.
     pub(crate) allow_alternate_screen: bool,
 
+    /// The `scroll-on-clear` option: a clear of the whole screen sends what
+    /// the screen showed to history first. On by default, as in tmux
+    /// (options-table.c:1723 at tag 3.8). It belongs to the pane, so a reset
+    /// keeps it.
+    scroll_on_clear: bool,
+
+    /// The cursor colour: the program's (`OSC 12`), and the default the
+    /// pane's `cursor-colour` option gives (tmux's `s->ccolour` and
+    /// `s->default_ccolour`, screen.c:91-92 at tag 3.8). Both survive RIS and
+    /// a respawn, since `screen_reinit` touches neither.
+    cursor_colour: CursorColour,
+
+    /// The default foreground and background: the program's (`OSC 10` and
+    /// `OSC 11`, tmux's `wp->palette.fg` and `.bg`), and the colours the
+    /// pane's styles put over and under them. RIS, a bare `OSC 104` and
+    /// `send-keys -R` drop the program's, as `colour_palette_clear` does
+    /// (colour.c:1227 at tag 3.8); a respawn keeps them.
+    default_colours: DefaultColours,
+
     /// True once the output stream asked its terminal for win32 input mode
     /// (`CSI ?9001h`).  On a psmux pane that request comes from the pane's
     /// console host itself, as the very first bytes it writes (`ESC[?9001h
@@ -283,6 +311,14 @@ pub struct Screen {
     /// exactly as tmux's input.c does (INPUT_CSI_MODSET / INPUT_CSI_MODOFF),
     /// and reset by RIS.  Issue #860.
     extended_keys_mode: u8,
+    /// The tab stops, one per column, as tmux's `s->tabs`. Both screens share
+    /// them, as tmux keeps one table for the normal and the alternate screen,
+    /// and a change of width puts back the default (screen.c:373 at tag 3.8).
+    /// Last, so the fields read for every printed character keep their place.
+    tabs: Vec<bool>,
+    /// Whether HTS or TBC changed `tabs` since it was last the default, so HT
+    /// can keep to the arithmetic of every eighth column until then.
+    tabs_changed: bool,
 }
 
 /// The `extended-keys` server option as a number, tmux's
@@ -342,6 +378,75 @@ pub fn xtmodkeys_off_mode(current: u8, ek: u8, resource: u16) -> u8 {
     if ek == 2 { 1 } else { 0 }
 }
 
+/// See [`Screen::cursor_colour`].
+#[derive(Clone, Copy, Debug)]
+struct CursorColour {
+    /// Set by `OSC 12`, cleared by `OSC 112`.
+    program: Option<(u8, u8, u8)>,
+    /// From the `cursor-colour` option.
+    default: Option<(u8, u8, u8)>,
+    /// See [`Screen::set_program_cursor_colour_enabled`].
+    program_enabled: bool,
+}
+
+impl CursorColour {
+    const fn new() -> Self {
+        Self { program: None, default: None, program_enabled: true }
+    }
+}
+
+/// What a pane's styles give one of its default colours, over and under the
+/// colour the program set.
+///
+/// tmux's `tty_default_colours` (tty.c:3164 at tag
+/// 3.8) draws the active pane with `window-active-style`, then the program's
+/// colour, then `window-style`, and any other pane with `window-style`, then
+/// the program's colour; the query is answered the same way
+/// (`window_pane_get_bg`, window.c:2699).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StyleColour {
+    /// Wins over the program's colour.
+    pub over: Option<(u8, u8, u8)>,
+    /// Used when neither `over` nor the program gives one.
+    pub under: Option<(u8, u8, u8)>,
+}
+
+/// One default colour. See [`Screen::default_foreground`].
+#[derive(Clone, Copy, Debug, Default)]
+struct DefaultColour {
+    program: Option<(u8, u8, u8)>,
+    style: StyleColour,
+}
+
+impl DefaultColour {
+    fn get(self) -> Option<(u8, u8, u8)> {
+        self.style.over.or(self.program).or(self.style.under)
+    }
+}
+
+/// See [`Screen::default_foreground`].
+#[derive(Clone, Copy, Debug)]
+struct DefaultColours {
+    fg: DefaultColour,
+    bg: DefaultColour,
+    /// See [`Screen::set_program_default_colours_enabled`].
+    program_enabled: bool,
+}
+
+impl DefaultColours {
+    const fn new() -> Self {
+        let none = DefaultColour { program: None, style: StyleColour { over: None, under: None } };
+        Self { fg: none, bg: none, program_enabled: true }
+    }
+
+    /// These with the program's colours dropped.
+    fn without_program(mut self) -> Self {
+        self.fg.program = None;
+        self.bg.program = None;
+        self
+    }
+}
+
 /// A pane's `pane-colours` default palette and the palette it draws with:
 /// the defaults with the OSC 4 entries laid over them, kept up to date as
 /// either changes so that drawing reads one table, as it did before #980.
@@ -387,6 +492,8 @@ impl Screen {
         Self {
             grid,
             alternate_grid: crate::grid::Grid::new(size, 0),
+            tabs: default_tabs(size.cols),
+            tabs_changed: false,
 
             attrs: crate::attrs::Attrs::default(),
             saved_attrs: crate::attrs::Attrs::default(),
@@ -395,6 +502,7 @@ impl Screen {
             saved_charsets: crate::charset::Charsets::default(),
             alternate_saved_charsets: crate::charset::Charsets::default(),
             alternate_saved_cursor: None,
+            cursor_saved_by_1049: false,
 
             modes: 0,
             mouse_protocol_mode: MouseProtocolMode::default(),
@@ -410,6 +518,7 @@ impl Screen {
             capture_queries: false,
             pending_queries: Vec::new(),
             osc52_clipboard: None,
+            host_events: Default::default(),
             hyperlinks: Vec::new(),
             sixel_images: Vec::new(),
             osc_shell_command: None,
@@ -420,6 +529,9 @@ impl Screen {
             squelch_clear_pending: false,
             audible_bell_count: 0,
             allow_alternate_screen: true,
+            scroll_on_clear: true,
+            cursor_colour: CursorColour::new(),
+            default_colours: DefaultColours::new(),
             win32_input_requested: false,
             extended_keys_mode: initial_extended_keys_mode(),
         }
@@ -431,6 +543,13 @@ impl Screen {
     /// step with the pseudo console's own buffer; the alternate screen is
     /// only cut or padded, as a full screen application redraws it anyway.
     pub fn set_size(&mut self, rows: u16, cols: u16) {
+        // tmux puts the default stops back when the width changes, and
+        // keeps them for a change of height alone (screen_resize, screen.c:371
+        // to :374 at tag 3.8).
+        if cols != self.grid.size().cols {
+            self.tabs = default_tabs(cols);
+            self.tabs_changed = false;
+        }
         self.grid.set_size_reflow(crate::grid::Size { rows, cols });
         self.alternate_grid
             .set_size(crate::grid::Size { rows, cols });
@@ -538,10 +657,14 @@ impl Screen {
         let pane_colours = self.pane_colours.take();
         let palette_generation = self.palette_generation;
         let allow_alternate_screen = self.allow_alternate_screen;
+        let scroll_on_clear = self.scroll_on_clear;
+        let cursor_colour = self.cursor_colour;
+        let default_colours = self.default_colours;
         let mut program_status = std::mem::take(&mut self.program_status);
         program_status.clear();
         let program_status_enabled = self.program_status_enabled;
         *self = Self::new(size, scrollback_len);
+        self.default_colours = default_colours;
         self.program_status = program_status;
         self.program_status_enabled = program_status_enabled;
         self.grid.put_scrollback(history);
@@ -550,6 +673,120 @@ impl Screen {
         self.pane_colours = pane_colours;
         self.palette_generation = palette_generation;
         self.allow_alternate_screen = allow_alternate_screen;
+        self.scroll_on_clear = scroll_on_clear;
+        self.cursor_colour = cursor_colour;
+    }
+
+    /// The cursor colour the terminal is to draw: the program's, then the
+    /// `cursor-colour` default, `None` for the terminal's own.
+    #[must_use]
+    pub fn cursor_colour(&self) -> Option<(u8, u8, u8)> {
+        self.cursor_colour.program.or(self.cursor_colour.default)
+    }
+
+    /// The colour the program set with `OSC 12`, `None` when it set none or
+    /// reset it with `OSC 112`.
+    #[must_use]
+    pub fn program_cursor_colour(&self) -> Option<(u8, u8, u8)> {
+        self.cursor_colour.program
+    }
+
+    /// Set the default the `cursor-colour` option gives. Returns whether the
+    /// colour to draw changed.
+    pub fn set_default_cursor_colour(&mut self, colour: Option<(u8, u8, u8)>) -> bool {
+        let before = self.cursor_colour();
+        self.cursor_colour.default = colour;
+        before != self.cursor_colour()
+    }
+
+    /// Whether `OSC 12` and `OSC 112` from the program are taken. On by
+    /// default. A host that passes on the colour a program sets but drops the
+    /// reset, as the inbox Windows console host does, turns it off, so that a
+    /// colour never outlives the program that set it.
+    pub fn set_program_cursor_colour_enabled(&mut self, enabled: bool) {
+        self.cursor_colour.program_enabled = enabled;
+        if !enabled {
+            self.cursor_colour.program = None;
+        }
+    }
+
+    /// Take the colours a program and the pane's options set, the two cursor
+    /// colours and the default colours, from the screen this one replaces.
+    /// psmux's `clear-history` starts the screen again, where tmux clears
+    /// only the history and keeps them (cmd-capture-pane.c:424 at tag 3.8).
+    pub fn keep_colours(&mut self, from: &Self) {
+        self.cursor_colour = from.cursor_colour;
+        self.default_colours = from.default_colours;
+    }
+
+    /// Set or reset the program's cursor colour, unless that is turned off.
+    pub(crate) fn set_program_cursor_colour(&mut self, colour: Option<(u8, u8, u8)>) {
+        if self.cursor_colour.program_enabled {
+            self.cursor_colour.program = colour;
+        }
+    }
+
+    /// The pane's default foreground as tmux answers `OSC 10 ; ?` with it:
+    /// the styles' colour over the program's, the program's, then the
+    /// styles' colour under it (see [`StyleColour`]). `None` leaves it to the
+    /// outer terminal's.
+    #[must_use]
+    pub fn default_foreground(&self) -> Option<(u8, u8, u8)> {
+        self.default_colours.fg.get()
+    }
+
+    /// The pane's default background, as [`Screen::default_foreground`].
+    #[must_use]
+    pub fn default_background(&self) -> Option<(u8, u8, u8)> {
+        self.default_colours.bg.get()
+    }
+
+    /// The foreground and background the program set with `OSC 10` and
+    /// `OSC 11`, `None` for one it set none of or reset.
+    #[must_use]
+    pub fn program_default_colours(&self) -> (Option<(u8, u8, u8)>, Option<(u8, u8, u8)>) {
+        (self.default_colours.fg.program, self.default_colours.bg.program)
+    }
+
+    /// Set what the pane's styles give its foreground and background.
+    pub fn set_style_colours(&mut self, fg: StyleColour, bg: StyleColour) {
+        self.default_colours.fg.style = fg;
+        self.default_colours.bg.style = bg;
+    }
+
+    /// Whether `OSC 10`, `OSC 11`, `OSC 110` and `OSC 111` from the program
+    /// are taken, as [`Screen::set_program_cursor_colour_enabled`] is for the
+    /// cursor colour.
+    pub fn set_program_default_colours_enabled(&mut self, enabled: bool) {
+        self.default_colours.program_enabled = enabled;
+        if !enabled {
+            self.default_colours = self.default_colours.without_program();
+        }
+    }
+
+    /// Set or reset the program's foreground, unless that is turned off.
+    pub(crate) fn set_program_foreground(&mut self, colour: Option<(u8, u8, u8)>) {
+        if self.default_colours.program_enabled {
+            self.default_colours.fg.program = colour;
+        }
+    }
+
+    /// Set or reset the program's background, unless that is turned off.
+    pub(crate) fn set_program_background(&mut self, colour: Option<(u8, u8, u8)>) {
+        if self.default_colours.program_enabled {
+            self.default_colours.bg.program = colour;
+        }
+    }
+
+    /// The `scroll-on-clear` option. See the field.
+    #[must_use]
+    pub fn scroll_on_clear(&self) -> bool {
+        self.scroll_on_clear
+    }
+
+    /// Set the `scroll-on-clear` option. See the field.
+    pub fn set_scroll_on_clear(&mut self, on: bool) {
+        self.scroll_on_clear = on;
     }
 
     /// Updates the maximum scrollback buffer size for the main grid.  Rows
@@ -1332,11 +1569,17 @@ impl Screen {
         self.osc94_progress
     }
 
-    /// Store an OSC 9;4 progress indicator. State is clamped to 0..=4 and
-    /// value to 0..=100 to match the Windows Terminal contract.
-    pub fn set_progress(&mut self, state: u8, value: u8) {
+    /// Store an OSC 9;4 progress indicator, as tmux's
+    /// `screen_set_progress_bar` (screen.c:344 at tag 3.8) does: the state
+    /// always changes, and the value only when one is given and the state is
+    /// not indeterminate (3). State is clamped to 0..=4 and value to 0..=100.
+    pub fn set_progress(&mut self, state: u8, value: Option<u8>) {
         let s = state.min(4);
-        let v = value.min(100);
+        let last = self.osc94_progress.map_or(0, |(_, v)| v);
+        let v = match value {
+            Some(v) if s != 3 => v.min(100),
+            _ => last,
+        };
         self.osc94_progress = Some((s, v));
     }
 
@@ -1384,13 +1627,15 @@ impl Screen {
 
     /// Ends a sixel the way the pane's console host does: `scroll` line feeds
     /// at the bottom margin to make room, then the text cursor goes to `row`,
-    /// back in the column the image started in.
+    /// back in the column the image started in. The lines scrolled in take
+    /// the current background, as tmux's do (screen-write.c:3120 at tag 3.8).
     pub(crate) fn finish_sixel(&mut self, scroll: u16, row: u16, col: u16) {
         let (_, _, bottom) = self.sixel_text_area();
+        let fill = self.attrs.erased();
         let grid = self.grid_mut();
         if scroll > 0 {
             grid.row_set(bottom);
-            grid.row_inc_scroll(scroll);
+            grid.row_inc_scroll(scroll, fill);
         }
         grid.row_set(row);
         grid.col_set(col);
@@ -1560,6 +1805,19 @@ impl Screen {
         }
     }
 
+    /// Drain exact notifications and enabled tmux passthrough bodies, once, in order.
+    pub fn take_host_events(&mut self) -> Vec<crate::HostEvent> {
+        self.host_events.take()
+    }
+
+    /// Queue an unescaped passthrough body as the parser does for an enabled
+    /// `DCS tmux;`. Public so server tests can queue one without flipping
+    /// the process wide `allow-passthrough` flag under parallel tests.
+    #[doc(hidden)]
+    pub fn push_host_passthrough(&mut self, bytes: Vec<u8>) {
+        self.host_events.push(bytes, true);
+    }
+
     /// Store an OSC 52 clipboard copy request emitted by the child.
     /// `selector` is the raw selector field (e.g. `b"c"`), `data` is the
     /// base64-encoded payload exactly as received.  Later writes overwrite
@@ -1633,9 +1891,11 @@ impl Screen {
         }
     }
 
-    /// Drop the whole palette (`colour_palette_clear`, `colour.c:1227`).
-    /// Returns `true` when something was dropped.
+    /// Drop the whole palette (`colour_palette_clear`, `colour.c:1227`),
+    /// which holds the program's default colours too. Returns `true` when an
+    /// entry was dropped.
     pub fn clear_palette(&mut self) -> bool {
+        self.default_colours = self.default_colours.without_program();
         let dropped = self.palette.take().is_some_and(|p| !p.is_empty());
         if dropped {
             self.palette_generation = self.palette_generation.wrapping_add(1);
@@ -1786,6 +2046,16 @@ impl Screen {
         self.squelch_clear_pending = v;
     }
 
+    /// True while the squelch detector is armed and no CSI 2J/3J has arrived
+    /// since.  Read only: unlike [`take_squelch_cleared`], asking does not
+    /// disturb the layout serialiser's signal.  The server arms it just before
+    /// injecting `cd <dir>; cls`, so once it reads false again the injected
+    /// `cd` has run.
+    #[must_use]
+    pub fn squelch_clear_armed(&self) -> bool {
+        self.squelch_clear_pending
+    }
+
     /// Internal: fire the squelch signal if armed.
     fn check_squelch_signal(&mut self) {
         if self.squelch_clear_pending {
@@ -1870,13 +2140,23 @@ impl Screen {
     }
 
     fn enter_alternate_grid(&mut self) {
-        if !self.mode(MODE_ALTERNATE_SCREEN) {
+        let entering = !self.mode(MODE_ALTERNATE_SCREEN);
+        if entering {
             let pos = self.grid.pos();
             self.alternate_saved_cursor = Some((pos.col, pos.row));
         }
         self.grid_mut().set_scrollback(0);
         self.set_mode(MODE_ALTERNATE_SCREEN);
         self.alternate_grid.allocate_rows();
+        if entering {
+            // tmux has one cursor for both screens, so it stays where it was
+            // (screen_alternate_on, screen.c at tag 3.8), and both console
+            // hosts keep it too. The alternate grid keeps a cursor of its
+            // own, which would otherwise start at 0,0 or where the last
+            // alternate session left it (#1032 follow up).
+            let pos = self.grid.pos();
+            self.alternate_grid.set_pos_absolute(pos);
+        }
         // Start the alternate screen's DECSC slot clean so a value left by a
         // previous alternate-screen session cannot surface in this one.
         self.alternate_saved_attrs = crate::attrs::Attrs::default();
@@ -2238,7 +2518,8 @@ impl Screen {
                 wrap = true;
             }
         }
-        self.grid_mut().col_wrap(width, wrap);
+        let fill = self.attrs.erased();
+        self.grid_mut().col_wrap(width, wrap, fill);
         let pos = self.grid().pos();
         // The hot path for every printed character: skip the image check
         // entirely when the pane holds no image.
@@ -2348,7 +2629,7 @@ impl Screen {
         // wrap is decided, as tmux does (screen-write.c:2701-2704); what
         // moves past the right margin is lost.
         if self.mode(MODE_INSERT) {
-            self.grid_mut().insert_cells(width);
+            self.grid_mut().insert_cells(width, crate::attrs::Attrs::default());
         }
         // No wrap: the character replaces the last one that fits
         // (screen-write.c:2707 wraps only with MODE_WRAP).
@@ -2373,12 +2654,90 @@ impl Screen {
         self.grid_mut().col_dec(1);
     }
 
+    /// HT: to the next tab stop, or the last column when there is none, and
+    /// nowhere from the last column (input.c:1331-1350 at tag 3.8).
     pub(crate) fn tab(&mut self) {
-        self.grid_mut().col_tab();
+        let last = self.grid().size().cols.saturating_sub(1);
+        let mut col = self.grid().pos().col;
+        if col >= last {
+            return;
+        }
+        if self.tabs_changed {
+            loop {
+                col += 1;
+                if col >= last || self.is_tab_stop(col) {
+                    break;
+                }
+            }
+        } else {
+            // The default table, every eighth column, without reading it.
+            col = (col - col % 8 + 8).min(last);
+        }
+        self.grid_mut().col_set(col);
+    }
+
+    /// The tab stops, the columns `#{pane_tabs}` lists.
+    pub fn tab_stops(&self) -> impl Iterator<Item = u16> + '_ {
+        (0u16..)
+            .zip(self.tabs.iter())
+            .filter(|&(_, &set)| set)
+            .map(|(col, _)| col)
+    }
+
+    fn is_tab_stop(&self, col: u16) -> bool {
+        self.tabs.get(usize::from(col)).copied().unwrap_or(false)
+    }
+
+    // ESC H: a tab stop at the cursor, unless it waits past the last column
+    // (input.c:1420-1423).
+    pub(crate) fn hts(&mut self) {
+        let col = usize::from(self.grid().pos().col);
+        if let Some(stop) = self.tabs.get_mut(col) {
+            *stop = true;
+            self.tabs_changed = true;
+        }
+    }
+
+    // CSI Ps g: 0 clears the stop at the cursor, 3 every stop, and any other
+    // value nothing (input.c:1854-1868).
+    pub(crate) fn tbc(&mut self, mode: u16) {
+        match mode {
+            0 => {
+                let col = usize::from(self.grid().pos().col);
+                if let Some(stop) = self.tabs.get_mut(col) {
+                    *stop = false;
+                    self.tabs_changed = true;
+                }
+            }
+            3 => {
+                self.tabs.fill(false);
+                self.tabs_changed = true;
+            }
+            _ => {}
+        }
+    }
+
+    // CSI Ps Z: back to the previous tab stop, `count` times, or to column 0,
+    // from the last column when the cursor waits past it (input.c:1491-1505).
+    pub(crate) fn cbt(&mut self, count: u16) {
+        let last = self.grid().size().cols.saturating_sub(1);
+        let mut col = self.grid().pos().col.min(last);
+        let mut count = count;
+        while col > 0 && count > 0 {
+            count -= 1;
+            loop {
+                col -= 1;
+                if col == 0 || self.is_tab_stop(col) {
+                    break;
+                }
+            }
+        }
+        self.grid_mut().col_set(col);
     }
 
     pub(crate) fn lf(&mut self) {
-        self.grid_mut().row_inc_scroll(1);
+        let fill = self.attrs.erased();
+        self.grid_mut().row_inc_scroll(1, fill);
     }
 
     pub(crate) fn vt(&mut self) {
@@ -2433,7 +2792,8 @@ impl Screen {
 
     // ESC M
     pub(crate) fn ri(&mut self) {
-        self.grid_mut().row_dec_scroll(1);
+        let fill = self.attrs.erased();
+        self.grid_mut().row_dec_scroll(1, fill);
     }
 
     // ESC c
@@ -2452,11 +2812,41 @@ impl Screen {
         let osc_title = std::mem::take(&mut self.osc_title);
         let title_stack = std::mem::take(&mut self.title_stack);
         let title_reset = self.title_reset;
+        // So does the progress indicator: only `screen_reinit` resets it
+        // (screen.c:139 at tag 3.8).
+        let progress = self.osc94_progress;
         // RIS drops the OSC 4 entries only; the pane-colours defaults belong
         // to the pane's options, not to the program (input.c:1407 clears
         // `p->palette` and leaves `p->default_palette`).
         let pane_colours = self.pane_colours.take().map(|c| c.defaults);
+        // The history stays, and with `scroll-on-clear` the screen joins it,
+        // as tmux's RIS and `send-keys -R` go through screen_write_clearscreen
+        // (screen-write.c:435). In the alternate screen tmux stays there and
+        // keeps the normal screen. Both console hosts leave it and blank the
+        // normal screen, so this does too, which is the reason the normal
+        // screen's rows go to history rather than being lost. The hyperlink
+        // table stays because history cells point into it.
+        let scroll_on_clear = self.scroll_on_clear;
+        let cursor_colour = self.cursor_colour;
+        // The program's default colours go, as tmux's RIS clears the palette
+        // they live in (input.c:1408); the styles' stay.
+        let default_colours = self.default_colours.without_program();
+        if scroll_on_clear {
+            self.grid
+                .erase_all_into_history(crate::attrs::Attrs::default());
+        }
+        let scrollback = self.grid.scrollback();
+        let frozen = self.grid.frozen();
+        let history = self.grid.take_scrollback();
+        let hyperlinks = std::mem::take(&mut self.hyperlinks);
         *self = Self::new(self.grid.size(), self.grid.scrollback_len());
+        self.grid.put_scrollback(history);
+        self.grid.set_scrollback(scrollback);
+        self.grid.set_frozen(frozen);
+        self.hyperlinks = hyperlinks;
+        self.scroll_on_clear = scroll_on_clear;
+        self.cursor_colour = cursor_colour;
+        self.default_colours = default_colours;
         if let Some(defaults) = pane_colours {
             self.pane_colours = Some(Box::new(PaneColours::new(defaults, None)));
         }
@@ -2468,13 +2858,15 @@ impl Screen {
         self.osc_title = osc_title;
         self.title_stack = title_stack;
         self.title_reset = title_reset;
+        self.osc94_progress = progress;
     }
 
     // csi codes
 
     // CSI @
     pub(crate) fn ich(&mut self, count: u16) {
-        self.grid_mut().insert_cells(count);
+        let fill = self.attrs.erased();
+        self.grid_mut().insert_cells(count, fill);
     }
 
     // CSI A
@@ -2523,21 +2915,43 @@ impl Screen {
     }
 
     // CSI J
+    //
+    // `CSI 2 J`, and `CSI 0 J` from the top left corner, are the two forms
+    // that clear the whole screen, and tmux sends the screen to history for
+    // both when `scroll-on-clear` is on and the alternate screen is not in use
+    // (screen-write.c:1941 and 2093 at tag 3.8).
     pub(crate) fn ed(
         &mut self,
         mode: u16,
+        unhandled: impl FnMut(&mut Self),
+    ) {
+        let into_history =
+            self.scroll_on_clear && !self.mode(MODE_ALTERNATE_SCREEN);
+        self.erase_in_display(mode, into_history, unhandled);
+    }
+
+    fn erase_in_display(
+        &mut self,
+        mode: u16,
+        into_history: bool,
         mut unhandled: impl FnMut(&mut Self),
     ) {
-        let attrs = self.attrs;
+        let attrs = self.attrs.erased();
         let pos = self.grid().pos();
         let size = self.grid().size();
         let line = self.grid().absolute_line_of_cursor();
         let top = line - u64::from(pos.row);
         match mode {
             0 => {
-                self.grid_mut().erase_all_forward(attrs);
+                // The images first: their lines are counted from where the
+                // rows are now, and a row keeps its line as it goes to history.
                 self.erase_image_cells(line, 1, pos.col, size.cols);
                 self.erase_image_cells(line + 1, u64::from(size.rows - 1 - pos.row), 0, size.cols);
+                if into_history && pos.row == 0 && pos.col == 0 {
+                    self.grid_mut().erase_all_into_history(attrs);
+                } else {
+                    self.grid_mut().erase_all_forward(attrs);
+                }
             }
             1 => {
                 self.grid_mut().erase_all_backward(attrs);
@@ -2545,7 +2959,11 @@ impl Screen {
                 self.erase_image_cells(line, 1, 0, pos.col + 1);
             }
             2 => {
-                self.grid_mut().erase_all(attrs);
+                if into_history {
+                    self.grid_mut().erase_all_into_history(attrs);
+                } else {
+                    self.grid_mut().erase_all(attrs);
+                }
                 self.drop_current_grid_images();
                 self.check_squelch_signal();
             }
@@ -2559,12 +2977,15 @@ impl Screen {
     }
 
     // CSI ? J
+    //
+    // Selective erase, not a clear of the screen, so nothing goes to history.
+    // tmux has no such sequence (input.c:314 lists `J` with no prefix only).
     pub(crate) fn decsed(
         &mut self,
         mode: u16,
         unhandled: impl FnMut(&mut Self),
     ) {
-        self.ed(mode, unhandled);
+        self.erase_in_display(mode, false, unhandled);
     }
 
     // CSI K
@@ -2573,7 +2994,7 @@ impl Screen {
         mode: u16,
         mut unhandled: impl FnMut(&mut Self),
     ) {
-        let attrs = self.attrs;
+        let attrs = self.attrs.erased();
         let pos = self.grid().pos();
         let cols = self.grid().size().cols;
         let line = self.grid().absolute_line_of_cursor();
@@ -2605,41 +3026,54 @@ impl Screen {
 
     // CSI L
     pub(crate) fn il(&mut self, count: u16) {
-        self.grid_mut().insert_lines(count);
+        let fill = self.attrs.erased();
+        self.grid_mut().insert_lines(count, fill);
     }
 
     // CSI M
     pub(crate) fn dl(&mut self, count: u16) {
-        self.grid_mut().delete_lines(count);
+        let fill = self.attrs.erased();
+        self.grid_mut().delete_lines(count, fill);
     }
 
     // CSI P
     pub(crate) fn dch(&mut self, count: u16) {
-        self.grid_mut().delete_cells(count);
+        let fill = self.attrs.erased();
+        self.grid_mut().delete_cells(count, fill);
     }
 
     // CSI S
     pub(crate) fn su(&mut self, count: u16) {
-        self.grid_mut().scroll_up(count);
+        let fill = self.attrs.erased();
+        self.grid_mut().scroll_up(count, fill);
     }
 
     // CSI T
     pub(crate) fn sd(&mut self, count: u16) {
-        self.grid_mut().scroll_down(count);
+        let fill = self.attrs.erased();
+        self.grid_mut().scroll_down(count, fill);
     }
 
     // CSI X
     pub(crate) fn ech(&mut self, count: u16) {
-        let attrs = self.attrs;
+        let attrs = self.attrs.erased();
         let pos = self.grid().pos();
         let line = self.grid().absolute_line_of_cursor();
         self.grid_mut().erase_cells(count, attrs);
         self.erase_image_cells(line, 1, pos.col, pos.col.saturating_add(count));
     }
 
-    // CSI d
+    // CSI d, counted from the top of the scroll region in origin mode
+    // (input.c:1870 at tag 3.8).
     pub(crate) fn vpa(&mut self, row: u16) {
-        self.grid_mut().row_set(row - 1);
+        self.grid_mut().row_set_in_origin(row - 1);
+    }
+
+    // ESC # 8
+    pub(crate) fn decaln(&mut self) {
+        self.grid_mut().alignment_pattern();
+        // tmux drops the images with them (screen-write.c:1327).
+        self.drop_current_grid_images();
     }
 
     // CSI ? h
@@ -2656,7 +3090,14 @@ impl Screen {
                 [7] => self.clear_mode(MODE_NO_AUTOWRAP),
                 [9] => self.set_mouse_mode(MouseProtocolMode::Press),
                 [25] => self.clear_mode(MODE_HIDE_CURSOR),
-                [47] => self.enter_alternate_grid(),
+                // tmux clears the alternate screen for 47 as for 1049
+                // (screen_alternate_on), and keeps the cursor for both.
+                [47] => {
+                    if !self.mode(MODE_ALTERNATE_SCREEN) {
+                        self.alternate_grid.clear();
+                    }
+                    self.enter_alternate_grid();
+                }
                 [1000] => {
                     self.set_mouse_mode(MouseProtocolMode::PressRelease);
                 }
@@ -2670,10 +3111,16 @@ impl Screen {
                 [1006] => {
                     self.set_mouse_encoding(MouseProtocolEncoding::Sgr);
                 }
+                // On the alternate screen tmux does nothing for 1049: no
+                // save, no clear (screen_alternate_on, screen.c:700 at tag
+                // 3.8).
                 [1049] => {
-                    self.decsc();
-                    self.alternate_grid.clear();
-                    self.enter_alternate_grid();
+                    if !self.mode(MODE_ALTERNATE_SCREEN) {
+                        self.decsc();
+                        self.cursor_saved_by_1049 = true;
+                        self.alternate_grid.clear();
+                        self.enter_alternate_grid();
+                    }
                 }
                 [2004] => self.set_mode(MODE_BRACKETED_PASTE),
                 [9001] => self.win32_input_requested = true,
@@ -2696,8 +3143,18 @@ impl Screen {
                 [7] => self.set_mode(MODE_NO_AUTOWRAP),
                 [9] => self.clear_mouse_mode(MouseProtocolMode::Press),
                 [25] => self.set_mode(MODE_HIDE_CURSOR),
+                // 47 saves no cursor, so the cursor stays where the
+                // alternate screen left it (screen_alternate_off with cursor
+                // 0 at tag 3.8), as in both console hosts. 1049 below puts
+                // back the one it saved.
                 [47] => {
+                    let carried = self
+                        .mode(MODE_ALTERNATE_SCREEN)
+                        .then(|| self.alternate_grid.pos());
                     self.exit_alternate_grid();
+                    if let Some(pos) = carried {
+                        self.grid.set_pos_absolute(pos);
+                    }
                 }
                 [1000] => {
                     self.clear_mouse_mode(MouseProtocolMode::PressRelease);
@@ -2714,9 +3171,19 @@ impl Screen {
                 [1006] => {
                     self.clear_mouse_encoding(MouseProtocolEncoding::Sgr);
                 }
+                // The cursor comes back only if 1049 saved one
+                // (screen_alternate_off, screen.c:746 at tag 3.8); after 47
+                // it stays where the alternate screen left it, as for 47.
                 [1049] => {
+                    let carried = self
+                        .mode(MODE_ALTERNATE_SCREEN)
+                        .then(|| self.alternate_grid.pos());
                     self.exit_alternate_grid();
-                    self.decrc();
+                    if self.cursor_saved_by_1049 {
+                        self.decrc();
+                    } else if let Some(pos) = carried {
+                        self.grid.set_pos_absolute(pos);
+                    }
                 }
                 [2004] => self.clear_mode(MODE_BRACKETED_PASTE),
                 _ => unhandled(self),
@@ -2726,14 +3193,18 @@ impl Screen {
 
     // CSI h: of the ANSI modes only IRM, insert mode (input.c:2007 at tag
     // 3.8); tmux's other one, 34, is a cursor style psmux does not keep.
+    // `dectcem_25` reads mode 25 as DECTCEM, as the Windows 10 inbox conhost
+    // writes it (perform's `CONHOST_WIN10`).
     pub(crate) fn sm(
         &mut self,
         params: &vte::Params,
+        dectcem_25: bool,
         mut unhandled: impl FnMut(&mut Self),
     ) {
         for param in params {
             match param {
                 [4] => self.set_mode(MODE_INSERT),
+                [25] if dectcem_25 => self.clear_mode(MODE_HIDE_CURSOR),
                 _ => unhandled(self),
             }
         }
@@ -2743,11 +3214,13 @@ impl Screen {
     pub(crate) fn rm(
         &mut self,
         params: &vte::Params,
+        dectcem_25: bool,
         mut unhandled: impl FnMut(&mut Self),
     ) {
         for param in params {
             match param {
                 [4] => self.clear_mode(MODE_INSERT),
+                [25] if dectcem_25 => self.set_mode(MODE_HIDE_CURSOR),
                 _ => unhandled(self),
             }
         }
@@ -2960,6 +3433,12 @@ impl Screen {
     pub(crate) fn decstbm(&mut self, (top, bottom): (u16, u16)) {
         self.grid_mut().set_scroll_region(top - 1, bottom - 1);
     }
+}
+
+/// Every eighth column from column 8, as tmux's `screen_reset_tabs` sets them
+/// (screen.c:190-202 at tag 3.8).
+fn default_tabs(cols: u16) -> Vec<bool> {
+    (0..cols).map(|col| col != 0 && col % 8 == 0).collect()
 }
 
 fn u16_to_u8(i: u16) -> Option<u8> {

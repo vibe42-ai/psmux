@@ -119,6 +119,17 @@ impl Grid {
         crate::row::Row::new(self.size.cols)
     }
 
+    /// A row for an inserted line or a line scrolled in, blank with `fill`
+    /// (`Attrs::erased`, the current background).
+    fn blank_row(&self, fill: crate::attrs::Attrs) -> crate::row::Row {
+        if fill == crate::attrs::Attrs::default() {
+            return self.new_row();
+        }
+        let mut cell = crate::Cell::new();
+        cell.clear(fill);
+        crate::row::Row::filled(self.size.cols, cell)
+    }
+
     pub fn clear(&mut self) {
         self.pos = Pos::default();
         self.saved_pos = Pos::default();
@@ -290,6 +301,17 @@ impl Grid {
         self.row_clamp_top(self.origin_mode);
         self.row_clamp_bottom(self.origin_mode);
         self.col_clamp();
+    }
+
+    /// Put the cursor at `pos` as it is, counted from the top left of the
+    /// screen whatever the origin mode, as when the cursor carries over from
+    /// the other screen. A column one past the last, where the cursor waits
+    /// to wrap, stays.
+    pub fn set_pos_absolute(&mut self, pos: Pos) {
+        self.pos = Pos {
+            row: pos.row.min(self.size.rows.saturating_sub(1)),
+            col: pos.col.min(self.size.cols),
+        };
     }
 
     pub fn save_cursor(&mut self) {
@@ -753,6 +775,26 @@ impl Grid {
         }
     }
 
+    /// Clear the screen with what it showed going into history first, as
+    /// tmux's `grid_view_clear_history` does (grid-view.c at tag 3.8): rows
+    /// down to the last one holding text, blank ones between them included,
+    /// and nothing for a screen with no text. The scroll region plays no part.
+    /// The work is at most the height of the screen.
+    pub fn erase_all_into_history(&mut self, attrs: crate::attrs::Attrs) {
+        if let Some(last) = self.rows.iter().rposition(|row| !row.is_blank()) {
+            let moved: Vec<_> = self.rows.drain(..=last).collect();
+            for row in moved {
+                self.push_row_to_scrollback(row);
+            }
+            let cols = self.size.cols;
+            self.rows.extend(
+                std::iter::repeat_with(|| crate::row::Row::new(cols))
+                    .take(last + 1),
+            );
+        }
+        self.erase_all(attrs);
+    }
+
     pub fn erase_all_forward(&mut self, attrs: crate::attrs::Attrs) {
         let pos = self.pos;
         for row in self.drawing_rows_mut().skip(usize::from(pos.row) + 1) {
@@ -793,7 +835,7 @@ impl Grid {
         }
     }
 
-    pub fn insert_cells(&mut self, count: u16) {
+    pub fn insert_cells(&mut self, count: u16, fill: crate::attrs::Attrs) {
         let size = self.size;
         let pos = self.pos;
         let wide = pos.col < size.cols
@@ -804,12 +846,14 @@ impl Grid {
                 // size.cols
                 .unwrap()
                 .is_wide_continuation();
+        let mut blank = crate::Cell::new();
+        blank.clear(fill);
         let row = self.current_row_mut();
         for _ in 0..count {
             if wide {
                 row.get_mut(pos.col).unwrap().set_wide_continuation(false);
             }
-            row.insert(pos.col, crate::Cell::new());
+            row.insert(pos.col, blank.clone());
             if wide {
                 row.get_mut(pos.col).unwrap().set_wide_continuation(true);
             }
@@ -817,14 +861,22 @@ impl Grid {
         row.truncate(size.cols);
     }
 
-    pub fn delete_cells(&mut self, count: u16) {
+    pub fn delete_cells(&mut self, count: u16, fill: crate::attrs::Attrs) {
         let size = self.size;
         let pos = self.pos;
+        let count = count.min(size.cols - pos.col);
         let row = self.current_row_mut();
-        for _ in 0..(count.min(size.cols - pos.col)) {
+        for _ in 0..count {
             row.remove(pos.col);
         }
         row.resize(size.cols, crate::Cell::new());
+        // The columns freed at the right take `fill`; with the default they
+        // are the unstored tail already.
+        if fill != crate::attrs::Attrs::default() {
+            for col in size.cols - count..size.cols {
+                row.erase(col, fill);
+            }
+        }
     }
 
     pub fn erase_cells(&mut self, count: u16, attrs: crate::attrs::Attrs) {
@@ -836,27 +888,27 @@ impl Grid {
         }
     }
 
-    pub fn insert_lines(&mut self, count: u16) {
+    pub fn insert_lines(&mut self, count: u16, fill: crate::attrs::Attrs) {
         for _ in 0..count {
             self.rows.remove(usize::from(self.scroll_bottom));
-            self.rows.insert(usize::from(self.pos.row), self.new_row());
+            self.rows.insert(usize::from(self.pos.row), self.blank_row(fill));
             // self.scroll_bottom is maintained to always be a valid row
             self.rows[usize::from(self.scroll_bottom)].wrap(false);
         }
     }
 
-    pub fn delete_lines(&mut self, count: u16) {
+    pub fn delete_lines(&mut self, count: u16, fill: crate::attrs::Attrs) {
         for _ in 0..(count.min(self.size.rows - self.pos.row)) {
             self.rows
-                .insert(usize::from(self.scroll_bottom) + 1, self.new_row());
+                .insert(usize::from(self.scroll_bottom) + 1, self.blank_row(fill));
             self.rows.remove(usize::from(self.pos.row));
         }
     }
 
-    pub fn scroll_up(&mut self, count: u16) {
+    pub fn scroll_up(&mut self, count: u16, fill: crate::attrs::Attrs) {
         for _ in 0..(count.min(self.size.rows - self.scroll_top)) {
             self.rows
-                .insert(usize::from(self.scroll_bottom) + 1, self.new_row());
+                .insert(usize::from(self.scroll_bottom) + 1, self.blank_row(fill));
             let mut removed = self.rows.remove(usize::from(self.scroll_top));
             if self.scrollback_len > 0 && !self.scroll_region_active() {
                 // The row stops being mutable the moment it becomes history,
@@ -876,36 +928,74 @@ impl Grid {
         }
     }
 
-    pub fn scroll_down(&mut self, count: u16) {
+    pub fn scroll_down(&mut self, count: u16, fill: crate::attrs::Attrs) {
         for _ in 0..count {
             self.rows.remove(usize::from(self.scroll_bottom));
             self.rows
-                .insert(usize::from(self.scroll_top), self.new_row());
+                .insert(usize::from(self.scroll_top), self.blank_row(fill));
             // self.scroll_bottom is maintained to always be a valid row
             self.rows[usize::from(self.scroll_bottom)].wrap(false);
         }
     }
 
+    /// DECSTBM, rows counted from 0. As both console hosts do it: a region
+    /// whose bottom is past the screen, or of one line or less, is ignored and
+    /// the cursor stays, and a region that is set sends the cursor home, which
+    /// is the top of the region in origin mode. tmux differs in three places,
+    /// all on purpose here so that psmux's screen stays where the host's is on
+    /// the `OpenConsole` route: it homes to the top left of the screen in origin
+    /// mode, it cuts a bottom past the screen to the last row, and it ignores
+    /// `ESC[0;0r`, which it reads as a one line region (screen-write.c:1775,
+    /// input.c:1620 at tag 3.8). Measured with `OpenConsole` and the inbox conhost.
     pub fn set_scroll_region(&mut self, top: u16, bottom: u16) {
-        let bottom = bottom.min(self.size().rows - 1);
-        if top < bottom {
-            self.scroll_top = top;
-            self.scroll_bottom = bottom;
-        } else {
-            self.scroll_top = 0;
-            self.scroll_bottom = self.size().rows - 1;
+        if bottom >= self.size().rows || top >= bottom {
+            return;
         }
-        // DECSTBM homes the cursor: the top left of the screen, or of the
-        // scroll region while origin mode is on.
+        self.scroll_top = top;
+        self.scroll_bottom = bottom;
         self.set_pos(Pos { row: 0, col: 0 });
     }
 
+    /// The scroll region, its top and bottom rows counted from 0, as
+    /// `#{scroll_region_upper}` and `#{scroll_region_lower}` show them.
     pub fn scroll_region(&self) -> (u16, u16) {
         (self.scroll_top, self.scroll_bottom)
     }
 
     pub fn origin_mode(&self) -> bool {
         self.origin_mode
+    }
+
+    /// VPA: to row `row` and keep the column. In origin mode the row counts
+    /// from the top of the scroll region and stops at its bottom, as tmux's
+    /// `screen_write_cursormove` does with `origin` (screen-write.c:1716 at tag 3.8).
+    pub fn row_set_in_origin(&mut self, row: u16) {
+        if self.origin_mode {
+            let span = self.scroll_bottom - self.scroll_top;
+            self.pos.row = self.scroll_top + row.min(span);
+        } else {
+            self.row_set(row);
+        }
+    }
+
+    /// DECALN: every cell an `E` with the default attributes, the scroll
+    /// region the whole screen, and the cursor at the top left
+    /// (`screen_write_alignmenttest`, screen-write.c:1316 at tag 3.8). Origin
+    /// mode goes off too, which tmux keeps and both console hosts clear.
+    pub fn alignment_pattern(&mut self) {
+        let cols = self.size.cols;
+        for row in self.drawing_rows_mut() {
+            row.clear(crate::attrs::Attrs::default());
+            for col in 0..cols {
+                if let Some(cell) = row.get_mut(col) {
+                    cell.set('E', crate::attrs::Attrs::default());
+                }
+            }
+        }
+        self.scroll_top = 0;
+        self.scroll_bottom = self.size.rows - 1;
+        self.origin_mode = false;
+        self.pos = Pos { row: 0, col: 0 };
     }
 
     fn in_scroll_region(&self) -> bool {
@@ -927,12 +1017,12 @@ impl Grid {
         self.row_clamp_bottom(in_scroll_region);
     }
 
-    pub fn row_inc_scroll(&mut self, count: u16) -> u16 {
+    pub fn row_inc_scroll(&mut self, count: u16, fill: crate::attrs::Attrs) -> u16 {
         let in_scroll_region = self.in_scroll_region();
         self.pos.row = self.pos.row.saturating_add(count);
         let lines = self.row_clamp_bottom(in_scroll_region);
         if in_scroll_region {
-            self.scroll_up(lines);
+            self.scroll_up(lines, fill);
             lines
         } else {
             0
@@ -945,14 +1035,14 @@ impl Grid {
         self.row_clamp_top(in_scroll_region);
     }
 
-    pub fn row_dec_scroll(&mut self, count: u16) {
+    pub fn row_dec_scroll(&mut self, count: u16, fill: crate::attrs::Attrs) {
         let in_scroll_region = self.in_scroll_region();
         // need to account for clamping by both row_clamp_top and by
         // saturating_sub
         let extra_lines = count.saturating_sub(self.pos.row);
         self.pos.row = self.pos.row.saturating_sub(count);
         let lines = self.row_clamp_top(in_scroll_region);
-        self.scroll_down(lines + extra_lines);
+        self.scroll_down(lines + extra_lines, fill);
     }
 
     /// The scroll region as `(top, bottom)` screen rows, both inclusive.
@@ -978,18 +1068,17 @@ impl Grid {
         self.pos.col = self.pos.col.saturating_sub(count);
     }
 
-    pub fn col_tab(&mut self) {
-        self.pos.col -= self.pos.col % 8;
-        self.pos.col += 8;
-        self.col_clamp();
-    }
-
     pub fn col_set(&mut self, i: u16) {
         self.pos.col = i;
         self.col_clamp();
     }
 
-    pub fn col_wrap(&mut self, width: u16, wrap: bool) {
+    /// Wraps to the next line, scrolling at the bottom margin. The line
+    /// scrolled in takes `fill`, the current background, as both console
+    /// hosts do; tmux leaves it default (`screen_write_linefeed(ctx, 1, 8)`,
+    /// screen-write.c:2709 at tag 3.8), but on the `OpenConsole` route the
+    /// pane then showed a line the inbox route showed coloured.
+    pub fn col_wrap(&mut self, width: u16, wrap: bool, fill: crate::attrs::Attrs) {
         // `cols - width` underflows for a glyph wider than the row, which a
         // pane shrunk to one column produces (#534). Screen::text drops such a
         // glyph before reaching here, but col_wrap is reachable from elsewhere,
@@ -997,7 +1086,7 @@ impl Grid {
         if self.pos.col > self.size.cols.saturating_sub(width) {
             let mut prev_pos = self.pos;
             self.pos.col = 0;
-            let scrolled = self.row_inc_scroll(1);
+            let scrolled = self.row_inc_scroll(1, fill);
             let new_pos = self.pos;
             // On a ONE row screen the row that wrapped has just scrolled off
             // (0 - 1): it is history now, or gone with no scrollback, and

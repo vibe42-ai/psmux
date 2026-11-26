@@ -75,6 +75,16 @@ impl std::io::Write for QueuedPaneWriter {
 }
 
 impl PaneInputSink for QueuedPaneWriter {
+    fn resize_prime_hook(&self) -> Option<Box<dyn FnMut() + Send>> {
+        let tx = self.tx.clone();
+        let closed = self.closed.clone();
+        Some(Box::new(move || {
+            if !closed.load(Ordering::Acquire) {
+                let _ = tx.send(PaneInput::Bytes(portable_pty::win::conpty::CYGWIN_RESIZE_PRIME.to_vec()));
+            }
+        }))
+    }
+
     fn queue_inject_paste(&mut self, job: InjectPaste) -> Result<(), InjectPaste> {
         self.tx.send(PaneInput::InjectPaste(job)).map_err(|e| match e.0 {
             PaneInput::InjectPaste(job) => job,
@@ -164,6 +174,31 @@ pub trait PaneInputSink: std::io::Write + Send {
     /// writer cannot carry it (or its thread is gone).
     fn queue_inject_paste(&mut self, job: InjectPaste) -> Result<(), InjectPaste> {
         Err(job)
+    }
+
+    /// A hook that queues the Cygwin resize prime behind everything already
+    /// queued for this pane (see [`wire_resize_prime`]).  `None` when this
+    /// writer has no queue to keep it in order.
+    fn resize_prime_hook(&self) -> Option<Box<dyn FnMut() + Send>> {
+        None
+    }
+}
+
+/// Hand `master` a hook that queues
+/// [`portable_pty::win::conpty::CYGWIN_RESIZE_PRIME`] on `writer`'s queue
+/// after every resize that changes the size.  The master keeps it only when
+/// the pane child runs on the Cygwin console runtime (Git bash, MSYS2,
+/// Cygwin), which loses the first input record after a resize; other panes
+/// never see the prime.
+///
+/// The prime rides the pane's own input queue, not a second handle on the
+/// pipe: resizes and every write that queues pane input run on the server
+/// thread, and the pane writer thread delivers queued items whole and in
+/// order, so the prime lands after whatever was queued before the resize (a
+/// whole paste, a whole key sequence) and never inside it.
+pub(crate) fn wire_resize_prime(master: &dyn portable_pty::MasterPty, writer: &dyn PaneInputSink) {
+    if let Some(hook) = writer.resize_prime_hook() {
+        let _ = master.set_resize_hook(hook);
     }
 }
 
@@ -514,11 +549,7 @@ pub fn prefer_app_execution_alias(resolved: String) -> String {
 /// probe process.
 pub fn cached_shell() -> Option<&'static str> {
     CACHED_SHELL_PATH.get_or_init(|| {
-        let store_unusable = || {
-            std::env::var_os("SSH_CONNECTION").is_some()
-                || std::env::var_os("SSH_CLIENT").is_some()
-                || in_session_zero()
-        };
+        let store_unusable = store_shell_unusable;
         let which_path = |name: &str| {
             which::which(name).ok().map(|p| p.to_string_lossy().into_owned())
         };
@@ -534,6 +565,16 @@ pub fn cached_shell() -> Option<&'static str> {
             || which_path("cmd"),
         )
     }).as_deref()
+}
+
+/// Can this process NOT start a Store (MSIX) packaged program? True under an
+/// SSH command or in session 0, where MSIX activation fails with
+/// ACCESS_DENIED (see [`cached_shell`]). Shared by everything that picks a
+/// shell, so a pane and a `run-shell` never disagree about it.
+pub fn store_shell_unusable() -> bool {
+    std::env::var_os("SSH_CONNECTION").is_some()
+        || std::env::var_os("SSH_CLIENT").is_some()
+        || in_session_zero()
 }
 
 /// Is this path an MSIX/Store packaged executable (app execution alias or
@@ -1061,6 +1102,7 @@ pub(crate) fn silent_rehome(pane: &mut Pane, dir: &str, syntax: RehomeSyntax) {
         requested: crate::util::normalize_dir_for_display(dir),
         stale,
         settled: std::sync::atomic::AtomicBool::new(false),
+        reading_follows_cd: matches!(syntax, RehomeSyntax::PowerShell | RehomeSyntax::Cmd),
     });
     // Tell the vt100 parser to watch for the next screen-clear (CSI 2J/3J);
     // its arrival tells the layout serialiser the clear finished (event-driven).
@@ -1176,22 +1218,11 @@ pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mu
         // booting during that wait rather than after it.
         schedule_warm_refill(app);
     }
-    if claimed.is_none() {
-        // Nothing to hand over, so the cold path below is about to take
-        // `next_pane_id` for itself. Every id the in flight refills already
-        // reserved is lower than that, so those spares may no longer be handed
-        // out: doing so walked the visible sequence backwards (`%2 %3 %12 %4`).
-        // Retire them now and refuse them on arrival. Applies whether the pool
-        // was empty or the transplant was bypassed outright (a command, `-e`, a
-        // dynamic default-shell).
-        let dropped = app.warm_pane.set_issued_floor(app.next_pane_id);
-        if dropped > 0 {
-            crate::warm_trace!(
-                "pool: id floor raised to {}, discarded {} spare(s) whose ids are now in the past",
-                app.next_pane_id, dropped
-            );
-        }
-    }
+    // Nothing to hand over, so the cold path below needs an id of its own. See
+    // `cold_spawn_pane_id`. Applies whether the pool was empty or the
+    // transplant was bypassed outright (a command, `-e`, a dynamic
+    // default-shell).
+    let cold_id = if claimed.is_none() { Some(cold_spawn_pane_id(app)) } else { None };
     if let Some(mut wp) = claimed {
         crate::warm_trace!(
             "claim(new-window): pane={} spare_age={:.1}ms pool_left={} ready_left={} took={} last=\"{}\" inflight={} pool=[{}]",
@@ -1270,6 +1301,7 @@ pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mu
     let rows = if area.height > 1 { area.height } else { 30 }.max(MIN_PANE_DIM);
     let cols = if area.width > 1 { area.width } else { 120 }.max(MIN_PANE_DIM);
     let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
+    let pane_id = cold_id.unwrap_or(app.next_pane_id);
     crate::startup_trace::mark("srv.pty.open");
     let pair = pty_system
         .openpty(size)
@@ -1296,13 +1328,15 @@ pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mu
             shell_cmd.cwd(usable);
         }
     }
-    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
+    set_tmux_env(&mut shell_cmd, pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
     set_host_colors_env(&mut shell_cmd, app.host_colors.as_ref());
     apply_user_environment(&mut shell_cmd, &app.environment);
     apply_env_removals(&mut shell_cmd, &app.env_scopes.child_removals(&app.environment));
     // new-window -e KEY=VALUE (#489): pane-scoped env, applied last so it
     // overrides the session environment, matching tmux.
     for (k, v) in extra_env { shell_cmd.env(k, v); }
+    // The command's own `cd`/`env` run inside sh after all of that (#1077).
+    apply_launch_overrides(&mut shell_cmd, command);
     if crate::startup_trace::on() {
         crate::startup_trace::mark_detail("srv.child.argv", &format!("{:?}", shell_cmd.get_argv()));
     }
@@ -1339,17 +1373,22 @@ pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mu
 
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<u8>::new()));
     let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
-    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), app.next_pane_id, child_pid);
+    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), pane_id, child_pid);
 
     let configured_shell = if app.default_shell.is_empty() { None } else { Some(app.default_shell.as_str()) };
     let mut pty_writer = spawn_pane_write_queue(pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?);
     conpty_preemptive_dsr_response(&mut *pty_writer);
+    crate::pane::wire_resize_prime(&*pair.master, &*pty_writer);
     let epoch = std::time::Instant::now() - Duration::from_secs(2);
-    let pane_id = app.next_pane_id;
     let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, dead_info: None, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, win32_input_latched: false, input_off: false, scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None, cursor_shape, bell_pending, cpr_pending, color_query_pending, copy_state: None, live_term: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()), start_command: start_command_raw(command), cwd_hint: None };
-    app.next_pane_id += 1;
+    if pane_id == app.next_pane_id {
+        app.next_pane_id += 1;
+    }
     let win_name = command.map(|c| default_shell_name(Some(c), None)).unwrap_or_else(|| default_shell_name(None, configured_shell));
+    if !warm_eligible {
+        hold_pool_for_cold_pane(app, &pane);
+    }
     app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: win_name, id: app.next_win_id, area: app.client_area, window_size: None, window_options: Default::default(), activity_flag: false, bell_flag: false, silence_flag: false, last_output_time: std::time::Instant::now(), last_seen_version: 0, manual_rename: false, layout_index: 0, pane_mru: vec![pane_id], zoom_saved: None, linked_from: None, floating: Vec::new(), floating_focus: None });
     app.next_win_id += 1;
     app.active_idx = app.windows.len() - 1;
@@ -1608,6 +1647,56 @@ pub fn trickle_deficit(trickle: &mut bool, pool: &crate::types::WarmPool, defici
     }
     let booting = pool.inflight + (pool.len() - pool.ready_len());
     deficit.min(1usize.saturating_sub(booting))
+}
+
+/// The pane id for a creation that is about to cold spawn instead of taking a
+/// spare.
+///
+/// A spare's id is reserved when it is spawned (it is the shell's TMUX_PANE),
+/// so every pooled spare holds an id below `next_pane_id`. When the pool can
+/// give one up ([`crate::types::WarmPool::yield_front_id`]) this creation takes
+/// the lowest of them and only that spare is retired: ids still come out in
+/// creation order, as tmux numbers them, and the rest of the pool stays warm.
+/// Otherwise it takes `next_pane_id`, and every spare below that is retired
+/// and refused on arrival, since handing one out later would walk the visible
+/// sequence backwards (`%2 %3 %12 %4`).
+pub fn cold_spawn_pane_id(app: &mut AppState) -> usize {
+    if let Some(id) = app.warm_pane.yield_front_id() {
+        crate::warm_trace!(
+            "pool: cold spawn takes reserved id {} from the pool front, {} spare(s) kept",
+            id,
+            app.warm_pane.len()
+        );
+        return id;
+    }
+    let dropped = app.warm_pane.set_issued_floor(app.next_pane_id);
+    if dropped > 0 {
+        crate::warm_trace!(
+            "pool: id floor raised to {}, discarded {} spare(s) whose ids are now in the past",
+            app.next_pane_id, dropped
+        );
+    }
+    app.next_pane_id
+}
+
+/// Keep the pool's refill back while a pane that bypassed the pool (a command,
+/// `-e`, a dynamic default-shell) starts.
+///
+/// The refill for the spare that pane retired would otherwise boot a shell
+/// beside the command the user is waiting on, and a pwsh booting beside another
+/// costs it ~70 ms (see [`crate::types::BootHold`]). The hold is the one a
+/// starting server uses: it lets go once the pane has drawn something, or gone
+/// quiet, or after [`crate::types::WARM_READY_MAX_WAIT`] at most. Claims are not
+/// held, only the spawning of replacements.
+fn hold_pool_for_cold_pane(app: &mut AppState, pane: &Pane) {
+    if !app.warm_enabled || app.warm_pane.target == 0 {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let hold = app.boot_hold.get_or_insert_with(|| crate::types::BootHold::new(now));
+    if hold.watch(pane.id, pane.data_version.clone(), pane.term.clone(), now) {
+        crate::warm_trace!("pool: boot hold watching cold pane={}", pane.id);
+    }
 }
 
 pub fn schedule_warm_refill(app: &mut AppState) {
@@ -1936,6 +2025,7 @@ pub fn spawn_warm_pane_from(pty_system: &dyn portable_pty::PtySystem, p: &WarmSp
     let mut pty_writer = spawn_pane_write_queue(pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?);
     conpty_preemptive_dsr_response(&mut *pty_writer);
+    crate::pane::wire_resize_prime(&*pair.master, &*pty_writer);
     let now = std::time::Instant::now();
     // The phase breakdown is what showed the surge was serialised: `pty` stayed
     // flat while `proc` and its `wait` component climbed by one whole
@@ -2011,6 +2101,7 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
     let mut pty_writer = spawn_pane_write_queue(pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?);
     conpty_preemptive_dsr_response(&mut *pty_writer);
+    crate::pane::wire_resize_prime(&*pair.master, &*pty_writer);
     let epoch = std::time::Instant::now() - Duration::from_secs(2);
     let raw_pane_id = app.next_pane_id;
     let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: raw_pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, dead_info: None, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, win32_input_latched: false, input_off: false, scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None, cursor_shape, bell_pending, cpr_pending, color_query_pending, copy_state: None, live_term: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()), start_command: start_command_raw_argv(raw_args), cwd_hint: None };
@@ -2298,19 +2389,8 @@ pub fn split_active_placed(app: &mut AppState, kind: LayoutKind, command: Option
         }
         schedule_warm_refill(app);
     }
-    if claimed.is_none() {
-        // Cold path below: see the matching comment in `create_window_with_env`.
-        // Applies whether the pool was empty or the transplant was bypassed
-        // outright (a command, `-e`, a dynamic default-shell); either way this
-        // pane takes an id above every reserved one.
-        let dropped = app.warm_pane.set_issued_floor(app.next_pane_id);
-        if dropped > 0 {
-            crate::warm_trace!(
-                "pool: id floor raised to {}, discarded {} spare(s) whose ids are now in the past",
-                app.next_pane_id, dropped
-            );
-        }
-    }
+    // Cold path below: see `cold_spawn_pane_id`.
+    let cold_id = if claimed.is_none() { Some(cold_spawn_pane_id(app)) } else { None };
     if let Some(mut wp) = claimed {
         crate::warm_trace!(
             "claim(split): pane={} spare_age={:.1}ms pool_left={} ready_left={} took={} last=\"{}\" inflight={} pool=[{}]",
@@ -2366,6 +2446,7 @@ pub fn split_active_placed(app: &mut AppState, kind: LayoutKind, command: Option
     }
 
     // ── Normal path: cold-spawn a new ConPTY + shell ────────────────
+    let split_pane_id = cold_id.unwrap_or(app.next_pane_id);
     let pair = pty_system.openpty(size).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
     // When no explicit command is given, use the configured default-shell.
     // Expand format variables like #{pane_current_path} at spawn time (#111).
@@ -2386,13 +2467,15 @@ pub fn split_active_placed(app: &mut AppState, kind: LayoutKind, command: Option
             shell_cmd.cwd(usable);
         }
     }
-    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
+    set_tmux_env(&mut shell_cmd, split_pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
     set_host_colors_env(&mut shell_cmd, app.host_colors.as_ref());
     apply_user_environment(&mut shell_cmd, &app.environment);
     apply_env_removals(&mut shell_cmd, &app.env_scopes.child_removals(&app.environment));
     // split-window -e KEY=VALUE (#489): pane-scoped env, applied last so it
     // overrides the session environment, matching tmux.
     for (k, v) in extra_env { shell_cmd.env(k, v); }
+    // The command's own `cd`/`env` run inside sh after all of that (#1077).
+    apply_launch_overrides(&mut shell_cmd, command);
     let child = pair.slave.spawn_command(shell_cmd).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
     // Close the slave handle immediately – see create_window() comment.
     drop(pair.slave);
@@ -2414,17 +2497,23 @@ pub fn split_active_placed(app: &mut AppState, kind: LayoutKind, command: Option
     let cq_writer = color_query_pending.clone();
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<u8>::new()));
     let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
-    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), app.next_pane_id, child_pid);
+    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), split_pane_id, child_pid);
     // Queued like every other pane (78cebea missed this cold split path), so a
     // paste or keys into a split that was given a command never write the
     // pipe from the server thread.
     let mut pty_writer = spawn_pane_write_queue(pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?);
     conpty_preemptive_dsr_response(&mut *pty_writer);
+    crate::pane::wire_resize_prime(&*pair.master, &*pty_writer);
     let epoch = std::time::Instant::now() - Duration::from_secs(2);
-    let split_pane_id = app.next_pane_id;
-    let new_leaf = Node::Leaf(Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: split_pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, dead_info: None, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, win32_input_latched: false, input_off: false, scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None, cursor_shape, bell_pending, cpr_pending, color_query_pending, copy_state: None, live_term: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()), start_command: start_command_raw(command), cwd_hint: None });
-    app.next_pane_id += 1;
+    let new_pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: split_pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, dead_info: None, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, win32_input_latched: false, input_off: false, scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None, cursor_shape, bell_pending, cpr_pending, color_query_pending, copy_state: None, live_term: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()), start_command: start_command_raw(command), cwd_hint: None };
+    if split_pane_id == app.next_pane_id {
+        app.next_pane_id += 1;
+    }
+    if !warm_eligible {
+        hold_pool_for_cold_pane(app, &new_pane);
+    }
+    let new_leaf = Node::Leaf(new_pane);
     insert_split_leaf(app, kind, new_leaf, placement);
     let win = &mut app.windows[app.active_idx];
     // Add new pane to MRU (most recent)
@@ -3325,6 +3414,299 @@ fn split_spawn_tokens(cmd: &str) -> Vec<String> {
     tokens
 }
 
+/// A POSIX launch line read into its parts (#399, #1077).
+///
+/// Tools written for tmux start a pane program with a short sh script:
+/// `cd '<dir>' && exec env VAR=val ... '<prog>' args`, often wrapped in
+/// `/bin/sh -c "..."` (Claude Code 2.1.329 teammate panes). Under tmux, sh
+/// runs it: `cd` moves, `env` sets the variables, and `exec` replaces sh with
+/// the program. psmux has no sh to lean on (the pane shell is usually pwsh,
+/// which has neither `exec` nor `env`), so the line is taken apart here and
+/// each part is applied on the CommandBuilder instead.
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LaunchLine {
+    /// `cd <dir>` target, quotes removed.
+    pub cwd: Option<String>,
+    /// `unset VAR` from a wrapped script.
+    pub env_removes: Vec<String>,
+    /// `export VAR=val` from a wrapped script, then `env VAR=val` pairs, in
+    /// the order sh would apply them.
+    pub env_sets: Vec<(String, String)>,
+    /// Program and arguments, quotes removed.
+    pub argv: Vec<String>,
+    /// sh would REPLACE itself with the program: the line said `exec`, or it
+    /// came wrapped in `/bin/sh -c` (sh is the program that would have run
+    /// it, so no other shell belongs between the pane and the program).
+    pub replaces_shell: bool,
+}
+
+/// The script of a `<sh> -c <script>` argv: the `--` form respawn-pane and
+/// split-window carry (`respawn-pane -k -- /bin/sh -c "<cmd>"`).
+#[cfg(windows)]
+fn sh_c_script_from_argv(tokens: &[String]) -> Option<&str> {
+    if tokens.len() != 3 || tokens[1] != "-c" {
+        return None;
+    }
+    let lower = tokens[0].to_ascii_lowercase().replace('\\', "/");
+    let is_sh = matches!(
+        lower.as_str(),
+        "/bin/sh" | "/bin/bash" | "/usr/bin/sh" | "/usr/bin/bash"
+    );
+    if is_sh { Some(tokens[2].as_str()) } else { None }
+}
+
+/// Read `[cd <dir> &&] [exec] [env [VAR=val]...] prog args` into a
+/// LaunchLine. With `require_marker`, the line must carry `exec` or `env`
+/// (an unwrapped `cd x && prog` stays with the pane shell, as before).
+#[cfg(windows)]
+fn parse_launch_tail(script: &str, require_marker: bool) -> Option<LaunchLine> {
+    let mut rest = script.trim();
+    let mut cwd: Option<String> = None;
+    if let Some(after_cd) = rest.strip_prefix("cd ") {
+        let amp = find_unquoted_ampamp(after_cd)?;
+        cwd = Some(strip_quotes(after_cd[..amp].trim()).to_string());
+        rest = after_cd[amp + 2..].trim();
+    }
+    let mut exec = false;
+    if let Some(after) = rest.strip_prefix("exec ") {
+        exec = true;
+        rest = after.trim_start();
+    }
+    let mut tokens = split_spawn_tokens(rest);
+    let mut env_sets: Vec<(String, String)> = Vec::new();
+    let mut env = false;
+    if tokens.first().map(|t| t == "env").unwrap_or(false) {
+        env = true;
+        tokens.remove(0);
+        while let Some(tok) = tokens.first() {
+            let Some(eq) = tok.find('=') else { break };
+            let key = &tok[..eq];
+            if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                break;
+            }
+            env_sets.push((key.to_string(), tok[eq + 1..].to_string()));
+            tokens.remove(0);
+        }
+    }
+    if require_marker && !exec && !env {
+        return None;
+    }
+    if tokens.is_empty() {
+        return None;
+    }
+    Some(LaunchLine { cwd, env_removes: Vec::new(), env_sets, argv: tokens, replaces_shell: exec })
+}
+
+/// Recognise a POSIX launch line in a pane command, in any of the forms the
+/// spawn paths receive it:
+///   * `/bin/sh -c "<script>"` as one string (split-window with the words
+///     joined, `#{pane_start_command}` shows this),
+///   * `-- /bin/sh -c <script>` (the argv form, respawn-pane),
+///   * an unwrapped `[cd <dir> &&] [exec] env ...` line (#399).
+///
+/// Inside a wrapper, `unset`/`export` steps are honoured, and `cd <dir> &&
+/// prog` alone also counts, since sh would have run it. A wrapped script with
+/// no `cd`, `exec` or `env` (an Overstory style `unset X && prog`) is left to
+/// the older wrapper handling, which keeps its established behaviour.
+#[cfg(windows)]
+pub(crate) fn parse_launch_line(command: &str) -> Option<LaunchLine> {
+    let trimmed = command.trim();
+    let script: Option<String> = if let Some(rest) = trimmed.strip_prefix("--") {
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let toks = decode_argv(rest);
+        if let Some(s) = sh_c_script_from_argv(&toks) {
+            Some(s.to_string())
+        } else {
+            // A single token after `--` keeps string semantics.
+            if toks.len() == 1 {
+                return parse_launch_line(&toks[0]);
+            }
+            // `-- env A=1 prog` style argv: the joined words are the line.
+            let joined = rest.trim();
+            return parse_launch_tail(joined, true);
+        }
+    } else {
+        detect_bash_c_wrapper(trimmed).map(|(inner, _)| inner.to_string())
+    };
+    match script {
+        Some(script) => {
+            let (removes, sets, final_cmd) = parse_bash_env_script(&script);
+            let marked = final_cmd.trim_start().starts_with("cd ")
+                || final_cmd.trim_start().starts_with("exec ")
+                || final_cmd.trim_start().starts_with("env ");
+            if !marked {
+                return None;
+            }
+            let mut line = parse_launch_tail(&final_cmd, false)?;
+            line.env_removes = removes;
+            let mut all_sets = sets;
+            all_sets.append(&mut line.env_sets);
+            line.env_sets = all_sets;
+            line.replaces_shell = true;
+            Some(line)
+        }
+        None => parse_launch_tail(trimmed, true),
+    }
+}
+
+/// True when the argv words hold no shell syntax, so they can be handed to
+/// the program as they are (what `exec` does in sh).
+#[cfg(windows)]
+fn launch_argv_is_plain(argv: &[String]) -> bool {
+    !argv.iter().any(|w| {
+        matches!(w.as_str(), "&&" | "||" | "|" | ";" | "&" | "<" | ">" | ">>" | "2>&1")
+            || w.contains('$')
+            || w.contains('`')
+            || w.starts_with('>')
+            || w.starts_with('<')
+            || w.ends_with(';')
+    })
+}
+
+/// True when CreateProcess (through `build_argv_command`) can start this
+/// program by itself: an existing file path, or a bare name PATH resolves to
+/// an `.exe`, `.com`, `.bat` or `.cmd`. Anything else (a `.ps1`, a PowerShell
+/// alias or function) needs the pane shell.
+#[cfg(windows)]
+fn launch_program_spawnable(prog: &str) -> bool {
+    let p = prog.replace('/', "\\");
+    if p.contains('\\') {
+        let lower = p.to_ascii_lowercase();
+        let runnable_ext = [".exe", ".com", ".bat", ".cmd"].iter().any(|e| lower.ends_with(e));
+        if std::path::Path::new(&p).is_file() {
+            return runnable_ext;
+        }
+        // CreateProcess appends .exe to a path given without an extension.
+        return std::path::Path::new(&format!("{}.exe", p)).is_file();
+    }
+    // A bare name: an image CreateProcess runs alone (bare_program_image also
+    // keeps Store images off this route under SSH), or a batch script that
+    // build_argv_command hands to cmd.exe.
+    bare_program_image(&p).is_some() || batch_script_target(&p).is_some()
+}
+
+/// Write a LaunchLine's program and arguments as a command for the given
+/// pane shell, for the cases that still go through one.
+#[cfg(windows)]
+fn render_launch_for_shell(shell_path: &str, argv: &[String]) -> String {
+    let stem = std::path::Path::new(shell_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if stem == "cmd" {
+        argv.iter()
+            .map(|t| {
+                if t.is_empty() || t.chars().any(|c| c.is_whitespace()) {
+                    format!("\"{}\"", t)
+                } else {
+                    t.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else if matches!(stem.as_str(), "bash" | "sh" | "zsh" | "fish" | "dash" | "ash") {
+        argv.iter()
+            .map(|t| {
+                if !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=@%+,\\".contains(c)) {
+                    t.clone()
+                } else {
+                    format!("'{}'", t.replace('\'', "'\\''"))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        // pwsh / powershell: the call operator runs a quoted program path.
+        format!(
+            "& {}",
+            argv.iter().map(|t| quote_for_pwsh(t)).collect::<Vec<_>>().join(" ")
+        )
+    }
+}
+
+/// Build the pane process for a LaunchLine.
+///
+/// When sh would have replaced itself with the program (`exec`, or the line
+/// came wrapped in `/bin/sh -c`) and the words are a plain program call, the
+/// program is started directly, exactly as tmux ends up with it: no shell
+/// stays between the pane and the program, whatever the pane shell is
+/// (pwsh, powershell or cmd), and nothing depends on an `exec` or `env`
+/// command existing. Otherwise the program runs through the pane shell,
+/// written in that shell's syntax, with the `env` and `cd` parts applied on
+/// the builder rather than left in the text for the shell to choke on.
+#[cfg(windows)]
+fn build_launch_command(line: &LaunchLine, env_shim: bool, allow_predictions: bool) -> CommandBuilder {
+    let apply = |builder: &mut CommandBuilder| {
+        if let Some(dir) = line.cwd.as_deref() {
+            if std::path::Path::new(dir).is_dir() {
+                builder.cwd(dir);
+            }
+        }
+        for var in &line.env_removes { builder.env_remove(var); }
+        for (k, v) in &line.env_sets { builder.env(k, v); }
+    };
+    if line.replaces_shell
+        && launch_argv_is_plain(&line.argv)
+        && launch_program_spawnable(&line.argv[0])
+    {
+        let mut builder = build_argv_command(&line.argv, env_shim, allow_predictions);
+        apply(&mut builder);
+        return builder;
+    }
+    let shell = cached_shell().map(|s| s.to_string()).unwrap_or_else(|| "pwsh.exe".to_string());
+    let text = render_launch_for_shell(&shell, &line.argv);
+    let mut builder = CommandBuilder::new(&shell);
+    if let Ok(dir) = std::env::current_dir() { builder.cwd(dir); }
+    apply_bare_env_if_set(&mut builder);
+    builder.env("TERM", "xterm-256color");
+    builder.env("COLORTERM", "truecolor");
+    builder.env("PSMUX_SESSION", "1");
+    apply(&mut builder);
+    let stem = std::path::Path::new(&shell).file_stem()
+        .and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+    if stem == "pwsh" || stem == "powershell" {
+        builder.args(["-NoLogo", "-Command", &text]);
+    } else if matches!(stem.as_str(), "bash" | "sh" | "zsh" | "fish" | "dash" | "ash") {
+        builder.args(["-c", &text]);
+    } else {
+        // cmd.exe: a quoted program path inside a `/C` argument would reach
+        // cmd with CreateProcess `\"` escapes it cannot read. Carry the line
+        // in a variable cmd expands once, as build_argv_command does for
+        // batch scripts (#794).
+        builder.env(BATCH_LINE_ENV, &text);
+        builder.args(["/d", "/c", &format!("%{}%", BATCH_LINE_ENV)]);
+    }
+    builder
+}
+
+/// Apply a launch line's `cd` and environment on top of everything the spawn
+/// site layered on (the `-c` start directory, the session environment,
+/// `-e`). Under tmux these run inside sh AFTER the pane's directory and
+/// environment are set, so they win; a split-window from a client sitting in
+/// another directory must still start the program in the `cd` target.
+/// A `cd` to a directory that does not exist is skipped (the pane then starts
+/// where the spawn site put it rather than failing to spawn at all).
+pub fn apply_launch_overrides(builder: &mut CommandBuilder, command: Option<&str>) {
+    #[cfg(windows)]
+    {
+        let Some(cmd) = command else { return };
+        let Some(line) = parse_launch_line(cmd) else { return };
+        if let Some(dir) = line.cwd.as_deref() {
+            if std::path::Path::new(dir).is_dir() {
+                builder.cwd(dir);
+            }
+        }
+        for var in &line.env_removes { builder.env_remove(var); }
+        for (k, v) in &line.env_sets { builder.env(k, v); }
+    }
+    #[cfg(not(windows))]
+    let _ = (builder, command);
+}
+
 /// tmux parity for window/pane commands (issues #492, #493): tmux execs a
 /// multi-argument shell-command DIRECTLY (spawn.c: `execvp(argv[0], argv)`)
 /// and only routes single strings through `$SHELL -c`.  psmux wrapped every
@@ -3467,6 +3849,12 @@ pub fn build_command(command: Option<&str>, env_shim: bool, allow_predictions: b
         }
         other => other,
     };
+    // POSIX launch lines (#399, #1077): `[/bin/sh -c] [cd d &&] [exec] [env
+    // K=V...] prog args`, in the string or the `--` argv form.
+    #[cfg(windows)]
+    if let Some(line) = command.and_then(parse_launch_line) {
+        return build_launch_command(&line, env_shim, allow_predictions);
+    }
     // tmux parity (#582): an explicit `-- prog args...` argv with more than
     // one token is exec'd DIRECTLY (tmux spawn.c execvp), never routed
     // through a shell wrapper. The CLI and server encode the argv form by
@@ -3734,9 +4122,49 @@ fn resolve_shell_program(shell_path: &str) -> (String, Vec<String>) {
     if parsed.is_empty() {
         return (shell_path.to_string(), vec![]);
     }
+    if let Some(split) = unquoted_program_with_args(shell_path, &parsed[0]) {
+        return split;
+    }
     let program = parsed[0].clone();
     let extra = parsed[1..].to_vec();
     (program, extra)
+}
+
+/// An unquoted program path with a space in it and arguments after it, such
+/// as `C:\Program Files\PowerShell\7\pwsh.exe -NoLogo`: the word split cut the
+/// path at its first space, and `C:\Program` was spawned. tmux takes
+/// default-shell as one path; psmux also takes arguments after the program,
+/// so the program is the longest run of words from the start that names an
+/// existing file and the rest are its arguments. The longest, not the first,
+/// so a file planted at `C:\Program.exe` is never the one picked (the unquoted
+/// path search CreateProcess does).
+///
+/// Only for an unquoted value whose first word is a path; a bare name
+/// (`pwsh -NoLogo`) or a quoted program keeps the plain split and costs no
+/// file checks. When no prefix names a file the plain split stands.
+fn unquoted_program_with_args(shell_path: &str, first_word: &str) -> Option<(String, Vec<String>)> {
+    let value = shell_path.trim_start();
+    if value.starts_with('"') || value.starts_with('\'') {
+        return None;
+    }
+    // The first word counts as a candidate too: if `C:\Program` exists, the
+    // longer `C:\Program Files\...` still wins.
+    if !(first_word.contains('\\') || first_word.contains('/')) {
+        return None;
+    }
+    let mut program_end = None;
+    let mut prev_space = false;
+    for (i, c) in value.char_indices() {
+        let space = c == ' ' || c == '\t';
+        // The end of a word: Windows ignores trailing spaces in a path, so a
+        // prefix that ends in one would name the same file with the space kept.
+        if space && !prev_space && std::path::Path::new(&value[..i]).is_file() {
+            program_end = Some(i);
+        }
+        prev_space = space;
+    }
+    let end = program_end?;
+    Some((value[..end].to_string(), crate::commands::parse_command_line(&value[end..])))
 }
 
 /// Shell executable stems that are POSIX-style shells. When one of these is
@@ -4231,7 +4659,7 @@ pub fn xtversion_reply() -> String {
 //
 // tmux answers all of them from its own parser, so psmux answering them is
 // parity rather than invention.  Citations, tmux next-3.8 `input.c` in
-// C:\Users\godwin\Documents\workspace\tmux:
+// the tmux source tree:
 //
 //   input.c:1581-1595  INPUT_CSI_DA        -> input_reply(ictx, 1, "\033[?1;2c"),
 //                                             "\033[?1;2;4c" when built with
@@ -4283,6 +4711,10 @@ pub(crate) struct DecrqmState {
     /// The pane's size in cells, for the XTWINOPS size reports (issue #841).
     pub rows: u16,
     pub cols: u16,
+    /// The pane's own default colours (`Screen::default_foreground`), for
+    /// the replies that go in for a query the console host dropped.
+    pub default_fg: Option<(u8, u8, u8)>,
+    pub default_bg: Option<(u8, u8, u8)>,
 }
 
 impl DecrqmState {
@@ -4302,6 +4734,8 @@ impl DecrqmState {
             synchronized_output: false,
             rows: s.size().0,
             cols: s.size().1,
+            default_fg: s.default_foreground(),
+            default_bg: s.default_background(),
         }
     }
 }
@@ -4363,6 +4797,50 @@ pub(crate) fn device_reply(q: DeviceQuery, st: &DecrqmState) -> String {
         }
         DeviceQuery::WindowReport(op) => window_report(op, st.rows, st.cols),
         _ => String::new(),
+    }
+}
+
+/// Whether the pane's console host passes on both a program's colours
+/// (`OSC 10`, `OSC 11` and `OSC 12`) and their resets, so they can be taken.
+/// See the reader thread.
+fn program_colours_reach_psmux() -> bool {
+    #[cfg(windows)]
+    {
+        crate::input::pane_host_is_supplied()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+/// The reply to `OSC 12 ; ?`, in the form tmux's `input_osc_colour_reply`
+/// writes (input.c:2898 at tag 3.8), ended the way the query was.
+pub(crate) fn cursor_colour_reply((r, g, b): (u8, u8, u8), bel: bool) -> String {
+    format!(
+        "\x1b]12;rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}{}",
+        if bel { "\x07" } else { "\x1b\\" }
+    )
+}
+
+/// The colour registers an XTSMGRAPHICS reports, tmux's
+/// `SIXEL_COLOUR_REGISTERS` (tmux.h:4254 in tmux 3.8).
+const SIXEL_COLOUR_REGISTERS: u32 = 1024;
+
+/// The reply to an XTSMGRAPHICS. tmux answers it itself, without asking the
+/// outer terminal (`input_csi_dispatch_sm_graphics`, input.c:2103 in tmux
+/// 3.8): reading, resetting or reading the maximum of the colour registers
+/// succeeds, and anything else is a failure carrying the value asked.
+///
+/// `sixel` says whether the pane's programs were told sixel is there. A pane
+/// on a console host that answers DA1 itself, as the inbox one does, gets a
+/// list without sixel and its sixel is dropped before psmux sees it, so there
+/// every one is a failure rather than a limit nothing could use.
+fn graphics_reply(item: i32, action: i32, value: i32, sixel: bool) -> String {
+    if sixel && item == 1 && matches!(action, 1 | 2 | 4) {
+        format!("\x1b[?{item};0;{SIXEL_COLOUR_REGISTERS}S")
+    } else {
+        format!("\x1b[?{item};3;{value}S")
     }
 }
 
@@ -4429,6 +4907,12 @@ pub(crate) enum ReplyFallback {
     /// Nothing else carries it, so it is logged as lost: a DCS written to a
     /// pane's input pipe arrives as a bare ESC with its body eaten (#597).
     Lost(&'static str),
+    /// The clipboard's reply (`OSC 52 ; ?`), which only the server loop can
+    /// give, from its paste buffers or the system clipboard as its options
+    /// say: the batch holding it goes there (crate::clipboard_read), which
+    /// puts the reply in or leaves it out and delivers the batch. Once in,
+    /// it is lost if it cannot be injected, as an OSC is.
+    Clipboard { selection: u8, bel: bool },
 }
 
 /// One reply to one query.
@@ -4458,6 +4942,8 @@ pub(crate) struct PaneReply {
 /// attach fails, and only put the answer off.  The child cannot ask anything
 /// before it is connected, so its own DA1 is never the first one, and the
 /// inbox console host answers a program's DA1 itself and never passes one on.
+/// So once it is no longer open, this pane's programs get psmux's DA1 reply,
+/// which lists sixel, and an XTSMGRAPHICS is answered to match.
 ///
 /// The one reply nobody asked for is the Copilot CLI colour burst's (issue
 /// #473): it asks `?996n`, OSC 10, OSC 11 and OSC 4 for 0 to 15 together and
@@ -4471,13 +4957,27 @@ pub(crate) fn pane_replies(
     colours: &crate::types::HostColors,
     console_host_da1_open: &mut bool,
 ) -> Vec<PaneReply> {
-    use crate::server::helpers::{background_reply, foreground_reply, palette_reply, scheme_reply};
+    use crate::server::helpers::{background_reply, foreground_reply, palette_reply, pane_colour_reply, scheme_reply};
     use crate::types::{COLOR_QUERY_BG, COLOR_QUERY_FG, COLOR_QUERY_SCHEME};
     let colour = |text: Option<String>, bit: u32| {
         text.map(|text| PaneReply { text, fallback: ReplyFallback::Colour(bit), console_host: false })
     };
-    let fg = |bel| colour(foreground_reply(colours, bel), COLOR_QUERY_FG);
-    let bg = |bel| colour(background_reply(colours, bel), COLOR_QUERY_BG);
+    // The pane's own colour, its styles' or its program's, wins over the
+    // outer terminal's. The server loop's colour path knows only the outer
+    // terminal's, so a reply with the pane's has nowhere else to go.
+    let own = |n: u8, rgb, bel, kind| PaneReply {
+        text: pane_colour_reply(n, rgb, bel),
+        fallback: ReplyFallback::Lost(kind),
+        console_host: false,
+    };
+    let fg = |bel, pane: Option<(u8, u8, u8)>| match pane {
+        Some(rgb) => Some(own(10, rgb, bel, "OSC 10")),
+        None => colour(foreground_reply(colours, bel), COLOR_QUERY_FG),
+    };
+    let bg = |bel, pane: Option<(u8, u8, u8)>| match pane {
+        Some(rgb) => Some(own(11, rgb, bel, "OSC 11")),
+        None => colour(background_reply(colours, bel), COLOR_QUERY_BG),
+    };
     let asked_fg = queries.iter().any(|q| matches!(q, DeviceQuery::ForegroundColour { .. }));
     let asked_bg = queries.iter().any(|q| matches!(q, DeviceQuery::BackgroundColour { .. }));
     let mut burst = !asked_fg || !asked_bg;
@@ -4490,27 +4990,48 @@ pub(crate) fn pane_replies(
                 console_host: false,
             }),
             DeviceQuery::ColourScheme => colour(Some(scheme_reply(colours)), COLOR_QUERY_SCHEME),
-            DeviceQuery::ForegroundColour { bel } => fg(bel),
-            DeviceQuery::BackgroundColour { bel } => bg(bel),
+            DeviceQuery::ForegroundColour { colour, bel } => fg(bel, colour),
+            DeviceQuery::BackgroundColour { colour, bel } => bg(bel, colour),
             DeviceQuery::PaletteColour { index, own, bel } => {
                 let i = usize::from(index);
                 if i == 0 && burst {
                     // The burst's own OSC 10 and 11 never arrived, so they
-                    // end the way its palette query did.
+                    // end the way its palette query did, with the pane's
+                    // colours as the batch left them.
                     burst = false;
-                    if !asked_fg { out.extend(fg(bel)); }
-                    if !asked_bg { out.extend(bg(bel)); }
+                    if !asked_fg { out.extend(fg(bel, st.default_fg)); }
+                    if !asked_bg { out.extend(bg(bel, st.default_bg)); }
                 }
                 let text = palette_reply(i, colours, own, bel);
                 if i < 16 {
                     colour(text, 1 << i)
                 } else {
                     // The colour path's bits hold only the sixteen ANSI
-                    // colours, and it would ask the outer terminal's value,
-                    // which psmux does not have for this index.
+                    // colours; this index always has a reply (the pane's
+                    // entry or the xterm table), so only a failed injection
+                    // loses it.
                     text.map(|text| PaneReply { text, fallback: ReplyFallback::Lost("OSC 4"), console_host: false })
                 }
             }
+            // The program's colour, then the `cursor-colour` default, as the
+            // parser met the query; with neither there is no reply, as in
+            // tmux (input.c:3168-3176 at tag 3.8). It is psmux's own answer,
+            // so only a failed injection loses it.
+            DeviceQuery::CursorColour { colour, bel } => colour.map(|rgb| PaneReply {
+                text: cursor_colour_reply(rgb, bel),
+                fallback: ReplyFallback::Lost("OSC 12"),
+                console_host: false,
+            }),
+            DeviceQuery::Clipboard { selection, bel } => Some(PaneReply {
+                text: String::new(),
+                fallback: ReplyFallback::Clipboard { selection, bel },
+                console_host: false,
+            }),
+            DeviceQuery::GraphicsAttribute { item, action, value } => Some(PaneReply {
+                text: graphics_reply(item, action, value, !*console_host_da1_open),
+                fallback: ReplyFallback::Pipe,
+                console_host: false,
+            }),
             _ => {
                 let console_host = q == DeviceQuery::Da1 && std::mem::take(console_host_da1_open);
                 Some(device_reply(q, st))
@@ -4529,7 +5050,7 @@ pub(crate) fn pane_replies(
 /// `ReplyFallback` way, the PTY ones in order with the console host's.
 /// Returns true when anything was left for the server loop to write, so the
 /// caller wakes it again.
-fn deliver_replies(
+pub(crate) fn deliver_replies(
     pane_id: usize,
     child_pid: Option<u32>,
     replies: &[PaneReply],
@@ -4553,6 +5074,9 @@ fn deliver_replies(
             ReplyFallback::Colour(bit) => bits |= bit,
             ReplyFallback::Lost(kind) => {
                 crate::platform::mouse_inject::log_lost_reply(child_pid, kind, r.text.len());
+            }
+            ReplyFallback::Clipboard { .. } => {
+                crate::platform::mouse_inject::log_lost_reply(child_pid, "OSC 52", r.text.len());
             }
         }
     }
@@ -4785,6 +5309,12 @@ struct PaneParse {
     // The first DA1 of a pane is the console host's own, answered down
     // the PTY (`pane_replies`).
     console_host_da1_open: bool,
+    // The inbox console host passes on the colours a program sets
+    // (`OSC 10`, `OSC 11` and `OSC 12`) but drops their bare resets,
+    // `OSC 110`, `OSC 111` and `OSC 112` (`PSMUX_PANE_RAW` on 26300 and
+    // on 19045), so a colour taken from it would outlive the program.
+    // Only a host that passes them all, OpenConsole, has them taken.
+    program_colours: bool,
 }
 
 impl PaneParse {
@@ -4824,6 +5354,8 @@ impl PaneParse {
         if let Ok(mut parser) = self.term.lock() {
             parser.screen_mut().capture_queries(true);
             parser.screen_mut().set_program_status_enabled(program_status);
+            parser.screen_mut().set_program_cursor_colour_enabled(self.program_colours);
+            parser.screen_mut().set_program_default_colours_enabled(self.program_colours);
             parser.process(&bytes);
             device_queries = parser.screen_mut().take_queries();
             if !device_queries.is_empty() {
@@ -4882,7 +5414,18 @@ impl PaneParse {
             let replies = pane_replies(
                 &device_queries, &st, &colours, &mut self.console_host_da1_open,
             );
-            if deliver_replies(self.pane_id, self.child_pid, &replies, &self.color_query_pending) {
+            if crate::clipboard_read::wanted(&replies) || crate::clipboard_read::waits(self.pane_id) {
+                // The server loop answers the clipboard and delivers the
+                // batch, so the replies keep their order; a batch with no
+                // clipboard query goes behind one that still waits.
+                crate::clipboard_read::queue(crate::clipboard_read::Batch::new(
+                    self.pane_id,
+                    self.child_pid,
+                    replies,
+                    self.color_query_pending.clone(),
+                ));
+                crate::types::wake_server_loop();
+            } else if deliver_replies(self.pane_id, self.child_pid, &replies, &self.color_query_pending) {
                 crate::types::PTY_DATA_READY.store(true, Ordering::Release);
                 crate::types::wake_server_loop();
             }
@@ -4988,6 +5531,7 @@ pub fn spawn_reader_thread(
             published_palette_gen: u64::MAX,
             sync_gate: SyncGate::new(),
             console_host_da1_open: true,
+            program_colours: program_colours_reach_psmux(),
         }),
     });
     let feed_key = crate::control_ring::key(&output_ring);
@@ -5019,6 +5563,7 @@ pub fn spawn_reader_thread(
         }
         let mut local = vec![0u8; 65536];
         let mut zero_reads: u32 = 0;
+        let mut passthrough_unwrapper = crate::tmux_passthrough_unwrap::TmuxPassthroughUnwrapper::new();
         loop {
             match reader.read(&mut local) {
                 Ok(n) if n > 0 => {
@@ -5041,11 +5586,16 @@ pub fn spawn_reader_thread(
                     // instead of dropping the oldest (#875). Staged and
                     // ringed under one lock, so `hold_pane_output` finds the
                     // two at the same byte.
+                    // tmux passthrough wrappers are unwrapped first: ConPTY
+                    // drops their closing ESC \, which left iTerm2's tmux
+                    // integration inside an unterminated DCS
+                    // (see tmux_passthrough_unwrap).
+                    let for_control = passthrough_unwrapper.feed(&local[..n]);
                     let full = {
                         let mut st = feed_r.staging.lock().unwrap_or_else(|e| e.into_inner());
                         st.bytes.extend_from_slice(&local[..n]);
                         feed_r.cv.notify_one();
-                        crate::control_ring::append(&output_ring_r, &local[..n])
+                        crate::control_ring::append(&output_ring_r, &for_control)
                     };
                     if full {
                         crate::control_ring::wait_for_room(&output_ring_r);
@@ -5185,6 +5735,10 @@ mod test_sync_output_gate;
 mod test_control_reply_barrier;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_cold_pane_keeps_pool.rs"]
+mod test_cold_pane_keeps_pool;
+
+#[cfg(test)]
 #[path = "../tests-rs/test_issue597_xtversion_reply.rs"]
 mod test_issue597_xtversion_reply;
 
@@ -5201,8 +5755,16 @@ mod tests_issue597_da_replies;
 mod tests_issue841_winops_replies;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_graphics_attribute_replies.rs"]
+mod test_graphics_attribute_replies;
+
+#[cfg(test)]
 #[path = "../tests-rs/test_issue399_env_prefix.rs"]
 mod test_issue399_env_prefix;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue1077_exec_env_wrapper.rs"]
+mod test_issue1077_exec_env_wrapper;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue634_env_value_spaces.rs"]
@@ -5366,6 +5928,10 @@ mod tests_warm_pane_start_dir;
 mod tests_issue474_unix_shells;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_default_shell_path_with_space_and_args.rs"]
+mod tests_default_shell_path_with_space_and_args;
+
+#[cfg(test)]
 #[path = "../tests-rs/test_issue492_493_direct_spawn.rs"]
 mod tests_issue492_493_direct_spawn;
 
@@ -5384,6 +5950,10 @@ mod tests_pane_writer_queue;
 #[cfg(test)]
 #[path = "../tests-rs/test_pane_replay_file.rs"]
 mod tests_pane_replay_file;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_gitbash_resize_prime.rs"]
+mod tests_gitbash_resize_prime;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_psrl_history_redirect.rs"]

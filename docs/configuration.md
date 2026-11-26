@@ -209,6 +209,8 @@ As in tmux, a name that is neither in this table, nor in tmux's own options tabl
 | `synchronize-panes` | Bool | `off` | Send input to all panes |
 | `remain-on-exit` | Choice | `off` | Whether a pane stays after its program exits, as in tmux: `off`, `on`, `failed` (only when it exited with a nonzero status), `key` (until a key is typed in it in a client; `send-keys` does not close it) or `failed-key` (tmux 3.8: a clean exit closes it, a failed one stays until a key is typed in it). `split-window -k` sets `key` on the new pane |
 | `remain-on-exit-format` | Str | `Pane is dead (status N, time)` | Text written on the bottom line of a pane `remain-on-exit` kept, a format expanded for that pane (`#{pane_dead_status}`, `#{t:pane_dead_time}`). Empty writes nothing. Window and pane scope; `split-window -m text` sets it on the new pane |
+| `scroll-on-clear` | Bool | `on` | Whether clearing the whole screen sends what it showed to history first, as in tmux: `ESC[2J`, `ESC[H ESC[J`, RIS (`ESC c`) and `send-keys -R`, not in the alternate screen. PSReadLine's Ctrl+L is an `ESC[2J`, so what it clears stays in copy mode. `cls`, `Clear-Host` and `clear` also clear the history, so they leave nothing. Window and pane scope. On the inbox console host `ESC[H ESC[J` reaches psmux as a redraw of the screen, which cannot be told apart from one after a resize, so that form keeps nothing there. A program that writes `ESC[2J` instead keeps its screen on both console hosts |
+| `cursor-colour` | Str | empty | Colour of the cursor: a colour name, `colourN` or `#rrggbb`, or empty for the terminal's own. A program's `ESC ] 12` wins over it until `ESC ] 112`. Window and pane scope. tmux also takes the spelling `cursor-color`; psmux does not. See [Cursor](#cursor) |
 | `@kill-descendants` | Bool | `on` | Terminate a self-exited pane shell's background children (psmux extension) |
 | `@mouse-force` | Bool | `off` | Pane scoped only (`set-option -p -t %N @mouse-force on`). Forward the wheel into this pane even though its application registered for the mouse through neither channel psmux can see. psmux normally forwards only to a pane that asked, either by sending a mouse DECSET or by holding `ENABLE_MOUSE_INPUT` on its console, and it keeps that authorization for as long as the process that earned it is alive, so a `node` child entering raw mode can no longer take it away. Some applications never register through either channel on Windows: conhost can swallow their DECSET before psmux parses it, and libuv raw mode leaves their console without the mouse bit. Set this for that pane. Leave it off for panes running programs that do not read the mouse, which receive the report as literal keystrokes (psmux extension) |
 | `aggressive-resize` | Bool | `off` | Resize to smallest client |
@@ -235,10 +237,11 @@ As in tmux, a name that is neither in this table, nor in tmux's own options tabl
 | `warm` | Bool | `on` | Pre-spawn shells for instant window/pane creation (see [warm-sessions.md](warm-sessions.md)) |
 | `copy-command` | Str | | Shell command for clipboard pipe |
 | `codepoint-widths` | Str | | Array of overrides for how many columns Unicode codepoints occupy, comma separated or one element with `codepoint-widths[N]` (see [Codepoint widths](#codepoint-widths)) |
-| `terminal-features` | Str | *(tmux 3.8 defaults)* | Array of `pattern:feature:feature` entries, comma separated or one element with `terminal-features[N]`, starting as tmux's `xterm*:clipboard:ccolour:cstyle:focus:title`, `screen*:title` and `rxvt*:ignorefkeys`. psmux keeps it for `set`, `show` and `#{terminal-features}` so a tmux config carries over, but takes a client's features from the client itself at attach, so the entries change nothing |
+| `terminal-features` | Str | *(tmux 3.8 defaults)* | Array of `pattern:feature:feature` entries, comma separated or one element with `terminal-features[N]`, starting as tmux's `xterm*:clipboard:ccolour:cstyle:focus:title`, `screen*:title` and `rxvt*:ignorefkeys`, then `*:progressbar`, which is psmux's own. Only `progressbar` is read, for whether a client writes the progress indicator (`*:progressbar@` stops it, see [Progress Indicator](compatibility.md#progress-indicator-osc-94)). psmux keeps the rest for `set`, `show` and `#{terminal-features}` so a tmux config carries over, and takes a client's other features from the client itself at attach |
 | `user-keys` | Str | | Array of key sequences the outer terminal sends, comma separated or one element with `user-keys[N]`; the sequence of element N is the key `UserN` for `bind-key`. Read where psmux parses VT input itself, which the console input route does not (see [User keys](#user-keys)) |
-| `terminal-overrides` | Str | `linux*:AX@` | Array of `pattern:cap:cap` entries matched against the client's `TERM`. `smcup@` and `rmcup@` keep the attached client off the host terminal's alternate screen (see [Terminal overrides](#terminal-overrides)) |
+| `terminal-overrides` | Str | `linux*:AX@` | Array of `pattern:cap:cap` entries matched against the client's `TERM`. `smcup@` and `rmcup@` keep the attached client off the host terminal's alternate screen, and `Spb` changes or removes what it writes for the progress indicator (see [Terminal overrides](#terminal-overrides)) |
 | `set-clipboard` | Str | `external` | Clipboard interaction (`on`/`off`/`external`). A copy mode yank reaches the Windows clipboard on every value, with OSC 52 to the outer terminal unless `off`. An application's own OSC 52 creates a paste buffer only on `on`, as in tmux; on `external` psmux still forwards it to the outer terminal and the Windows clipboard, where tmux ignores it; `off` ignores it |
+| `get-clipboard` | Str | `buffer` | What a pane program's clipboard query (`OSC 52 ; ?`) is answered with: `off` nothing, `buffer` the newest automatic paste buffer, `request` the Windows clipboard, `both` the Windows clipboard kept as a buffer too. `request` and `both` need a client attached. Read only with `set-clipboard on`, as in tmux: no reply on `external` (the default) or `off`, nor on the inbox conhost of Windows 11, which drops the query. See [Clipboard Read](compatibility.md#clipboard-read-osc-52--) |
 | `main-pane-width` | String | `80` | Main pane width in the main-vertical layout, in cells or a percentage such as `30%` |
 | `main-pane-height` | String | `24` | Main pane height in the main-horizontal layout, in cells or a percentage such as `30%` |
 | `session-group` | Str | | Name of the session group this session joins. `none` or an empty value clears it. See [Session Groups](#session-groups) |
@@ -276,7 +279,7 @@ As in tmux, a name that is neither in this table, nor in tmux's own options tabl
 | `popup-border-lines` | Str | `single` | Popup border glyph set: `single`, `double`, `heavy`, `simple`, `rounded`, `padded`, `none`. `display-popup -b` overrides it for one popup, `-B` draws no border |
 | `popup-style` | Str | | Colours of the popup content area: cells the program leaves at the terminal default take them. `display-popup -s` overrides its colours for one popup |
 | `clock-mode-colour` | Str | | Colour of the `clock-mode` digits |
-| `clock-mode-style` | Str | | Accepted and stored, but never read. See [Accepted but Not Functional](#accepted-but-not-functional) |
+| `clock-mode-style` | Choice | `24-with-seconds` | Time format of the `clock-mode` clock: `12`, `24`, `12-with-seconds` or `24-with-seconds`, as in tmux. `set -w` sets it for one window. tmux's default is `24`; psmux keeps the seconds its clock always showed |
 | `window-status-format` | Str | `#I:#W#{?window_flags,#{window_flags}, }` | Inactive tab format. See [program-attention opt-in](program-status.md#opt-in-to-attention-indicators) |
 | `window-status-current-format` | Str | `#I:#W#{?window_flags,#{window_flags}, }` | Active tab format. |
 | `window-status-separator` | Str | `" "` | Tab separator |
@@ -486,6 +489,21 @@ drawing the cursor it was drawing. Both of them act on the blink a DECSCUSR
 code carries, so naming a shape is the form that works everywhere:
 `set -g cursor-style blinking-bar`, or `bar` with `cursor-blink on`.
 
+`cursor-colour` is the colour, as in tmux a window and pane option, empty by
+default for the terminal's own:
+
+```tmux
+set -g cursor-colour colour208
+set -w cursor-colour "#ff8800"
+set -gu cursor-colour
+```
+
+A program in the pane can set the colour too, with `ESC ] 12 ; colour`, and
+that wins until it resets it with `ESC ] 112`. psmux sends the active pane's
+colour to the terminal as tmux does, `ESC ] 12 ; rgb:rr/gg/bb BEL`, and
+`ESC ] 112 BEL` for the terminal's own, and puts the terminal's own back on the
+way out. A palette colour goes out as its xterm value, so `blue` is `#000080`.
+
 ### Popup and Window Styling
 
 `display-popup` overlays and the pane contents themselves can be styled separately from the borders around them:
@@ -513,7 +531,7 @@ layers on top of it one attribute at a time, matching tmux `tty.c`
 only when that option actually names an `fg`, and the same holds separately for
 `bg`. Anything it leaves unnamed comes from `window-style`.
 
-Three consequences worth knowing:
+Four consequences worth knowing:
 
 * `set -g window-style "bg=colour52"` on its own tints **every** pane, the
   active one included. You do not need to repeat the colour in
@@ -524,6 +542,10 @@ Three consequences worth knowing:
 * `bg=default` (tmux colour 8) names no colour, so
   `window-active-style "bg=default"` reads as "inherit `window-style`", not as
   "use the terminal background".
+* A program's own default colours (`OSC 10` and `OSC 11`) sit between the
+  two in the active pane, over `window-style` and under
+  `window-active-style`, and under `window-style` in the other panes. See
+  [Default Colours](compatibility.md#default-colours-osc-10-and-osc-11).
 
 Both options also accept a `dim=N` percentage, where `N` runs from 0 to 100, as
 newer tmux does. It scales the pane's colours toward black by that percentage
@@ -539,8 +561,6 @@ set -g window-active-style "bg=colour52"
 ```
 
 `popup-border-lines` accepts the tmux set: `single` (the default), `double`, `heavy`, `simple` (`+`, `-` and `|`), `rounded`, `padded` (blank cells) and `none`. With `none`, or `display-popup -B`, the popup has no frame and its command gets the whole `-w` by `-h` area. As in tmux, only the colours of `popup-border-style` and `popup-style` are used, a popup has no title unless `display-popup -T` gives one, and the `-S` and `-s` flags of `display-popup` win over the options for that popup.
-
-> **Note:** `clock-mode-style` is accepted and stored but never read. See [Accepted but Not Functional](#accepted-but-not-functional).
 
 ### Bell
 
@@ -972,7 +992,6 @@ setting that was never wired up.
 |---|---|
 | `lock-after-time` | Accepted and stored. Session locking is not implemented, so the timer never runs. `lock-client`, `lock-server` and `lock-session` exist as commands but nothing locks on a timer |
 | `lock-command` | Accepted and stored. Never read, for the same reason |
-| `clock-mode-style` | Accepted and stored. Use `clock-mode-colour`, which is read |
 
 Setting any of these produces no warning, because the values are stored verbatim in the user options
 map instead of being validated against a known option. For most of them `show-options` will read the
@@ -1628,12 +1647,13 @@ where every key keeps its modifiers without any of this.
 `terminal-overrides` is the tmux option for adjusting what psmux assumes about
 the terminal a client is attached from. psmux has no terminfo database: the
 client writes VT sequences directly. So of all the capabilities tmux knows,
-psmux honours the two that change what the client sends on its own account:
+psmux honours the three that change what the client sends on its own account:
 
 | Capability | Effect |
 |---|---|
 | `smcup` | Entering the host terminal's alternate screen (`ESC[?1049h`) when a client attaches |
 | `rmcup` | Leaving it again (`ESC[?1049l`) when the client detaches or exits |
+| `Spb` | The progress indicator of the active pane, see [Progress Indicator](compatibility.md#progress-indicator-osc-94) |
 
 Every other capability is accepted, kept, shown by `show-options`, and ignored.
 
@@ -1670,7 +1690,8 @@ How entries are read, the same way tmux reads them:
 
 The option is read by the server, from the config file or from a `set` at
 runtime, and each client decides when it attaches. A change made while a
-client is attached applies from the next attach.
+client is attached applies from the next attach, except `Spb`, which applies
+from the next time the indicator changes.
 
 Read it back with:
 

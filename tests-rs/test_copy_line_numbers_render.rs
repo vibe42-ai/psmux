@@ -13,7 +13,7 @@ fn cell(ch: char) -> CellJson {
     CellJson {
         text: ch.to_string(), fg: String::new(), bg: String::new(),
         bold: false, italic: false, underline: false, inverse: false,
-        dim: false, blink: false, hidden: false, strikethrough: false, overline: false,
+        dim: false, blink: false, hidden: false, strikethrough: false, overline: false, link: None,
     }
 }
 
@@ -23,11 +23,11 @@ fn copy_leaf(w: u16, h: u16, cy: u16, oy: usize) -> LayoutJson {
     let content: Vec<Vec<CellJson>> = (0..h).map(|_| (0..w).map(|_| cell('X')).collect()).collect();
     LayoutJson::Leaf {
         id: 0, rows: h, cols: w, cursor_row: 0, cursor_col: 0,
-        alternate_screen: false, wants_mouse: false, hide_cursor: true, cursor_shape: 0,
+        alternate_screen: false, wants_mouse: false, hide_cursor: true, cursor_shape: 0, cursor_colour: None, default_colours: None,
         active: true, copy_mode: true, scroll_offset: oy, view_offset: oy,
         sel_start_row: None, sel_start_col: None, sel_end_row: None, sel_end_col: None,
         sel_mode: None, copy_cursor_row: Some(cy), copy_cursor_col: Some(0),
-        content, rows_v2: Vec::new(), title: None, copy_hl: Vec::new(), images: vec![],
+        content, rows_v2: Vec::new(), title: None, clock: false, copy_hl: Vec::new(), images: vec![],
     }
 }
 

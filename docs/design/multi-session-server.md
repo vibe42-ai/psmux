@@ -520,7 +520,9 @@ spares inside the process; and per session status-interval hooks. A command run
 from inside the loop (a hook, the config) that targets ANOTHER session of the
 same server goes over TCP to that session's listener, which this same loop
 serves, so it waits for its reply timeout; the server wide writes are delivered
-from connection threads for exactly that reason. The config is loaded once per
+from connection threads for exactly that reason. A hook's `set` of a user
+option of a different session is different in some conditions. The known
+differences below give these conditions. The config is loaded once per
 session (as each per session server loads it), so a config's `run-shell` runs per
 session.
 
@@ -529,6 +531,16 @@ unsupported command answers `ERROR: unknown command: <name>`; whether the CLI th
 exits 1 depends on that command's CLI path, exactly as for any `ERROR` reply
 today. A crash that `catch_unwind` cannot catch (stack overflow, abort, a native
 fault) ends every session of the namespace (section 8).
+
+A line on a connection for one command to the `listener` of session A can name
+session B, for example `server-info -t B:` or `info -t $1`. The `listener` then
+sends the line to B before the alias changes it to `show-messages`, and the
+summary shows B. The same target with `show-messages` or `showmsgs` shows A.
+
+The `uptime` line shows the time since the `created_at` value of the session.
+Each session in the `shared` mode uses the value from its `AppState`. Two
+sessions can show the same `uptime`. All sessions of the `shared` server show
+the same `pid`.
 
 A hook's `new-session` makes its session after the hook, in the same loop cycle
 or in the next cycle. Thus a subsequent command of the same hook cannot find the new session.
@@ -541,6 +553,61 @@ session at the next frame of that session. With no `-c` or a relative `-c`, the
 start directory of the hook's session must be an absolute directory that is on
 the disk. If it is not, the start gives an error, but the `per-session` mode
 makes the session.
+
+A hook of A can set a user option of a different session B, or remove it with
+`-u`. The command then operates on the state of B in the loop, after the
+request of A. This occurs only when the command agrees with all of these
+conditions, after psmux changes the target `B`, `B*` or `=B` to `B:`:
+
+- The command is `set` or `set-option`, with no flags other than `-t`, `-q`
+  and `-u`.
+- The command has one `-t`, and its target names only the session, for
+  example `B` or `B:`.
+- The option name starts with `@`, has one or more ASCII letters, numbers,
+  `_` or `-` after it, and is not `@plugin`.
+- The command has no value with `-u`, and one value without `-u`.
+- No word has a space, a quote, `;`, `\` or `#`, and the value does not start
+  with `-`.
+- The words have one space between them.
+
+Two such commands for B in one hook keep their sequence, thus
+`set -t B: @x 1 \; set -t B: @x 2` gives `2` on B. If B stops before the loop
+gets to the command, the command does not operate.
+
+The loop operates these commands at four points of each cycle. The part of the
+cycle between two such points is an interval. An interval is one request, the
+`upkeep` of all the sessions, or all the session starts in the queue of the
+hooks. When a command for B goes to the control port of B, each subsequent
+command for B in the interval also goes to the port. This occurs also when the
+command agrees with the conditions.
+
+Thus the two commands of `set -t B: @x "a b" \; set -t B: @x c` go to the
+port, as before. An interval can hold more than one hook. If a hook sends a
+command for B to the port, a `set` for B in a subsequent hook of the interval
+also goes there.
+
+The errors of other commands for a different session show where they showed
+before. For example, the hook `kill-window -t B:9 \; set -t B: @x 1` shows
+`can't find window: 9` on the status line of B, and the `set` also sets `@x`
+on B. In `tmux`, the error stops the remaining commands of the group
+(`cmd-queue.c`).
+
+Other commands for a different session keep the previous path through the
+control port of that session. These include `new-window`, `split-window`,
+`send-keys`, each server wide write, and each other `set`. Such a command can
+operate after a subsequent command of the same hook.
+
+A command for B on the port can come from one interval, and a `set` for B in
+the loop from a subsequent interval. These two commands can operate in the
+opposite sequence. This also applies to a server wide write and to a command
+from a thread other than the loop. This can change the result when they write
+or read the same option.
+
+This also applies to a hook of B that the command on the port starts. For
+example, the hook of one request sends
+`new-window -t B:`, the `after-new-window` hook of B sets `@x`, and the hook of
+the next request sends `set -t B: @x c`. The `set` can operate before the hook
+of B, and then B keeps the value from the hook of B.
 
 **Measured** (`tests/perf_issue798_shared_vs_per_session.ps1`, 5 rounds of three
 `new-session -d` in a fresh namespace, Windows 11 26200, metrics JSON in
@@ -801,6 +868,10 @@ Step 3, the next one, each item its own PR and still entirely behind the switch:
      selected there by the destination's own copied arm (its hooks fire
      there), then the client switches as for a session target. A target
      that does not resolve is the error, and nothing changes anywhere.
+   * A hook's `set` of a user option of a different session can operate on
+     that session in the loop (`set -t B: @x 1`). The known differences give
+     the conditions. Most other commands of a hook for a different session go
+     to the control port of that session.
    * `new-session` from a binding or the prompt: the protocol handler runs it
      on a connection thread and starts `psmux server -s NAME ...` as a per
      session server would; inside the shared server `check_server_start`
@@ -819,9 +890,6 @@ Step 3, the next one, each item its own PR and still entirely behind the switch:
      (one more loopback hop per frame, and `#{client_pid}` and the read
      only check would have to be carried over), or a narrow hook in
      `connection.rs`.
-   * Commands the in server route runs in place rather than sending them to
-     the listener (`set -t B: ...`, `kill-window -t B:1`, ...) from a hook:
-     they act on, or fail in, the hook's own session.
    * `new-session` from a hook: the call in `commands.rs`
      (`queue_loop_start`) puts the start in a queue of the loop. The loop
      makes the session after the hook, in the same loop cycle or in the next
@@ -861,19 +929,48 @@ Step 3, the next one, each item its own PR and still entirely behind the switch:
    load-buffer, clear-history and respawn-pane, from an attached client and as
    one shot commands. Buffers are server wide, as in tmux (#925): the server
    keeps one set and lends it to a session for each request, as it lends the
-   id counters (`src/server/shared/buffers.rs`).
+   id counters (`src/server/shared/buffers.rs`). A `show-messages`, `showmsgs`,
+   `server-info` or `info` line on a connection for one command shows the
+   summary of the session. The `dispatch.rs` file had the arm, but `router.rs`
+   stopped the line.
+
+   Second batch (round 16), again copied arms only: respawn-window,
+   resize-window, find-window, list-clients (`-F`, `-f` too) and
+   refresh-client, from an attached client and as one shot commands. Measured
+   on master first (shared mode): find-window, respawn-window, list-clients
+   and refresh-client answered `unknown command`, and `resize-window -x 90 -y
+   20` exited 0 while the window stayed 120x30. list-clients lists the
+   clients of the session it runs in, as a per session server does; the CLI
+   already asks each session for a bare `list-clients`, so the output is the
+   same as the default mode's. A one shot `refresh-client -C/-B/-A/-f` stays
+   the handler's own `not a control client` error, as in the default mode.
+   show-window-options was never refused as a one shot command (the handler
+   sends `ShowWindowOptionsFor`, which step 2 already served); only the old
+   `ShowWindowOptions` request, which nothing sends any more, still has a name
+   in `refused.rs`.
+
+   Several namespaces side by side (`tests/test_issue798_multi_namespace_shared.ps1`):
+   two `-L` namespaces in shared mode with the same session names, next to a
+   namespace in the default mode, in one data directory. Each shared namespace
+   has one process and its own marker, every session its own port, key and
+   files, names never resolve across namespaces, send-keys, capture-pane,
+   attach, switch-client, kill-session and kill-server stay inside their
+   namespace, and the default namespace keeps one server per session. Nothing
+   needed fixing.
 
    Still refused. A one shot command gets `unknown command`; an attached client's
    binding, prompt or menu puts `not supported in shared server mode yet: <name>`
    on that session's status line instead of doing nothing (`refused.rs`):
-   break-pane, join-pane, new-pane (floats), respawn-window, resize-window,
+   break-pane, join-pane, new-pane (floats),
    pipe-pane, move-window, swap-window, link-window, unlink-window,
-   find-window, rename-session (the registry rename), `new-session -t` (groups),
-   choose-buffer, display-menu, display-popup, customize-mode, list-clients,
+   rename-session (the registry rename), `new-session -t` (groups),
+   choose-buffer, display-menu, display-popup, customize-mode,
    detach-client (`-a`, `-s`, another client), lock-client, suspend-client,
-   refresh-client, source-file, show-messages, show-window-options,
+   `refresh-client -f` from an attached client, source-file,
    list-commands, the prompt history commands, run-shell and wait-for. The
-   requests the server sends itself (finished config jobs, cross session
+   `router.rs` file also stops the internal request `__config-warnings`. An
+   attached client sees the name `show-messages` in the status line message for
+   this request. The requests the server sends itself (finished config jobs, cross session
    forwarding, control mode bookkeeping) are dropped silently, as before.
 4. Spare panes inside the shared process, so a new session's first pane is not a
    cold spawn.

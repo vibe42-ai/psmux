@@ -2,7 +2,7 @@ use std::io::{self, Write, BufRead, BufReader};
 use std::time::{Duration, Instant};
 use std::env;
 
-use chrono::Local;
+
 use crossterm::event::{Event, KeyCode, KeyModifiers, KeyEventKind};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
@@ -46,6 +46,89 @@ pub(crate) struct FloatJson {
     #[serde(default)] pub astyle: String,
     /// new-pane -R: its pane-border-style.
     #[serde(default)] pub bstyle: String,
+    /// The program's default colours, as a tiled pane's leaf carries them.
+    #[serde(default)] pub default_colours: Option<[Option<String>; 2]>,
+}
+
+fn layout_default_status_line(
+    mut left: Vec<Span<'static>>,
+    tabs: Vec<Span<'static>>,
+    mut right: Vec<Span<'static>>,
+    tab_ranges: &[(usize, usize, usize)],
+    active: Option<usize>,
+    width: usize,
+    justify: &str,
+    base: Style,
+) -> crate::style::LayoutResult {
+    use crate::style::{layout_status_list, overlay_status_spans, spans_visual_width,
+        truncate_spans_keep_tail, truncate_spans_to_width, LayoutResult, StatusRangeType};
+
+    // tmux's default status-format (format-draw.c): the window list is
+    // trimmed first, then status-right, then status-left. With
+    // absolute-centre the list is trimmed only against the full width and
+    // drawn over status-left and status-right.
+    truncate_spans_to_width(&mut left, width);
+    let left_w = spans_visual_width(&left);
+    truncate_spans_keep_tail(&mut right, width - left_w);
+    let right_w = spans_visual_width(&right);
+    let right_start = width - right_w;
+    let absolute = matches!(justify, "absolute-centre" | "absolute-center");
+    let available = if absolute { width } else { right_start - left_w };
+    // Without an active window tmux keeps the list start in view, or its
+    // middle for centred lists.
+    let focus = tab_ranges.iter().find(|(idx, _, _)| Some(*idx) == active)
+        .map(|(_, start, end)| *start..*end)
+        .unwrap_or_else(|| match justify {
+            "centre" | "center" | "absolute-centre" | "absolute-center" => {
+                let middle = spans_visual_width(&tabs) / 2;
+                middle..middle
+            }
+            _ => 0..0,
+        });
+    let list = layout_status_list(
+        &tabs, available, focus, &[Span::styled("<", base)], &[Span::styled(">", base)],
+    );
+    let tabs_w = spans_visual_width(&list.spans);
+    let tabs_start = match justify {
+        "centre" | "center" => left_w + (right_start - left_w) / 2 - tabs_w / 2,
+        "absolute-centre" | "absolute-center" => (width - tabs_w) / 2,
+        "right" => right_start - tabs_w,
+        _ => left_w,
+    };
+    // Ranges keep tmux's order (left, windows, right): a click on a list
+    // cell drawn over status-left still resolves to the first match.
+    let mut ranges = Vec::new();
+    if left_w > 0 { ranges.push((StatusRangeType::Left, 0, left_w as u16)); }
+    for &(idx, start, end) in tab_ranges {
+        if let Some((start, end)) = list.project_range(start, end) {
+            ranges.push((StatusRangeType::Window(idx),
+                (tabs_start + start) as u16, (tabs_start + end) as u16));
+        }
+    }
+    if right_w > 0 {
+        ranges.push((StatusRangeType::Right, right_start as u16, width as u16));
+    }
+    let spans = if tabs_start >= left_w && tabs_start + tabs_w <= right_start {
+        let mut spans = left;
+        if tabs_start > left_w {
+            spans.push(Span::styled(" ".repeat(tabs_start - left_w), base));
+        }
+        spans.extend(list.spans);
+        if right_start > tabs_start + tabs_w {
+            spans.push(Span::styled(" ".repeat(right_start - tabs_start - tabs_w), base));
+        }
+        spans.extend(right);
+        spans
+    } else {
+        // Only absolute-centre gets here: the list covers part of a side.
+        let mut line = left;
+        if right_start > left_w {
+            line.push(Span::styled(" ".repeat(right_start - left_w), base));
+        }
+        line.extend(right);
+        overlay_status_spans(&line, tabs_start, list.spans, width)
+    };
+    LayoutResult { spans, ranges }
 }
 
 /// Content rect of a float on screen: the same placement and border inset
@@ -700,6 +783,12 @@ pub(crate) struct HyperlinkRun {
     pub style: ratatui::style::Style,
 }
 
+/// The OSC 9;4 value this client last wrote or decided not to write, kept for
+/// the life of the client process so a switch-client, which starts
+/// `run_remote` again against another server, compares against what the
+/// terminal shows (issue #1028). `None` until the first change.
+static LAST_HOST_PROGRESS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 thread_local! {
     /// Hyperlink runs collected during the current frame's render, drained and
     /// emitted after `terminal.draw()`. Thread-local because the client renders
@@ -1167,6 +1256,42 @@ fn client_selection_owns_drag(
     mouse_selection && (mouse_selection_force || !pane_handles_mouse)
 }
 
+/// Whether any pane of the frame shows a clock (#1058), the focused one or a
+/// pane the focus left. The clock is drawn from the local time, so while one
+/// is on screen the client redraws even when the frame has not changed.
+pub fn layout_shows_clock(layout: &LayoutJson) -> bool {
+    match layout {
+        LayoutJson::Leaf { clock, .. } => *clock,
+        LayoutJson::Split { children, .. } => children.iter().any(layout_shows_clock),
+    }
+}
+
+/// Whether a clock on screen needs a redraw now (#1058): once per wall clock
+/// second, the only time its digits change. `drawn_sec` holds the second it
+/// was last drawn for; it is reset while no clock shows, so a clock that
+/// appears is drawn on the next pass.
+pub fn clock_redraw_due(shown: bool, drawn_sec: &mut u64) -> bool {
+    if !shown {
+        *drawn_sec = u64::MAX;
+        return false;
+    }
+    let sec = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    clock_second_changed(sec, drawn_sec)
+}
+
+/// The pure step of `clock_redraw_due`: true, and `drawn_sec` updated, when
+/// `sec` is a second the clock has not been drawn for.
+pub fn clock_second_changed(sec: u64, drawn_sec: &mut u64) -> bool {
+    if sec == *drawn_sec {
+        return false;
+    }
+    *drawn_sec = sec;
+    true
+}
+
 /// Check if the active pane is in server-side copy mode.
 /// When true, the client should NOT start its own text selection —
 /// the server handles cursor positioning and selection in copy mode.
@@ -1261,9 +1386,24 @@ fn copy_release_commands(
     cmds
 }
 
+/// The press a mouse-drag-enter-copy-mode drag sends again after
+/// `copy-enter`, so the selection anchors at the press cell. `R` marks it as
+/// a replay: the server ran the click timer for the real press already, and
+/// counting this one too made the drag a double click (#1031).
+fn copy_drag_replay_press(pane_id: usize, col: i16, row: i16) -> String {
+    format!("pane-mouse {} 0 {} {} R\n", pane_id, col, row)
+}
+
 #[cfg(test)]
 mod copy_release_repin_tests {
-    use super::{copy_release_commands, copy_release_repin};
+    use super::{copy_drag_replay_press, copy_release_commands, copy_release_repin};
+
+    #[test]
+    fn the_copy_drag_replay_is_marked_so_it_is_not_a_click() {
+        // #1031: the press replayed after copy-enter must not reach the
+        // server as a plain M press, which its click timer counts.
+        assert_eq!(copy_drag_replay_press(7, 14, 3), "pane-mouse 7 0 14 3 R\n");
+    }
 
     #[test]
     fn the_repin_reports_the_painted_cell_as_a_drag() {
@@ -1686,55 +1826,120 @@ pub(crate) fn compute_active_rect_json_zoom_aware(
     }
 }
 
+/// How a clock is drawn: its colour (`clock-mode-colour`) and its time
+/// format (`clock-mode-style`). A bare colour is the default format.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClockLook {
+    pub colour: Color,
+    pub style: crate::clock_style::ClockStyle,
+}
+
+impl From<Color> for ClockLook {
+    fn from(colour: Color) -> Self {
+        Self { colour, style: crate::clock_style::ClockStyle::default() }
+    }
+}
+
+/// One character of the big clock as 5 rows of equal width, `#` drawn.
+/// psmux's own glyphs, 3 wide; `M` is tmux's (window-clock.c:120-124 at tag
+/// 3.8), as 3 columns cannot hold it. A space is a gap as wide as a digit,
+/// as tmux skips one glyph for it (window-clock.c:301-303). `None` for a
+/// character the clock never shows.
+fn clock_glyph(ch: char) -> Option<[&'static str; 5]> {
+    Some(match ch {
+        '0' => ["###", "# #", "# #", "# #", "###"],
+        '1' => ["  #", "  #", "  #", "  #", "  #"],
+        '2' => ["###", "  #", "###", "#  ", "###"],
+        '3' => ["###", "  #", "###", "  #", "###"],
+        '4' => ["# #", "# #", "###", "  #", "  #"],
+        '5' => ["###", "#  ", "###", "  #", "###"],
+        '6' => ["###", "#  ", "###", "# #", "###"],
+        '7' => ["###", "  #", "  #", "  #", "  #"],
+        '8' => ["###", "# #", "###", "# #", "###"],
+        '9' => ["###", "# #", "###", "  #", "###"],
+        ':' => [" ", "#", " ", "#", " "],
+        'A' => ["###", "# #", "###", "# #", "# #"],
+        'P' => ["###", "# #", "###", "#  ", "#  "],
+        'M' => ["#   #", "## ##", "# # #", "#   #", "#   #"],
+        ' ' => ["   ", "   ", "   ", "   ", "   "],
+        _ => return None,
+    })
+}
+
+/// The width in columns of `text` in big glyphs: each glyph and one blank
+/// column between glyphs.
+pub fn clock_text_width(text: &str) -> u16 {
+    let widths: Vec<u16> = text.chars().filter_map(clock_glyph).map(|g| g[0].len() as u16).collect();
+    if widths.is_empty() {
+        return 0;
+    }
+    widths.iter().sum::<u16>() + widths.len() as u16 - 1
+}
+
 /// Render a large ASCII clock overlay (tmux clock-mode).
 /// Top-level so both the main viewport and the choose-tree/choose-session
 /// preview can share one implementation.
 pub fn render_clock_overlay(
     f: &mut Frame,
     area: Rect,
+    look: impl Into<ClockLook>,
+    window_style: Option<Style>,
+) {
+    let look = look.into();
+    let now = crate::strftime::now();
+    let time_str = crate::clock_style::time_text(
+        look.style,
+        now.hour() as u32,
+        now.minute() as u32,
+        now.second() as u32,
+    );
+    render_clock_text(f, area, &time_str, look.colour, window_style);
+}
+
+/// Draw the clock showing `time_str` (from crate::clock_style::time_text)
+/// over `area`, as [`render_clock_overlay`] does for the time now.
+pub fn render_clock_text(
+    f: &mut Frame,
+    area: Rect,
+    time_str: &str,
     colour: Color,
     window_style: Option<Style>,
 ) {
-    const DIGITS: [&[&str; 5]; 10] = [
-        &["###", "# #", "# #", "# #", "###"],
-        &["  #", "  #", "  #", "  #", "  #"],
-        &["###", "  #", "###", "#  ", "###"],
-        &["###", "  #", "###", "  #", "###"],
-        &["# #", "# #", "###", "  #", "  #"],
-        &["###", "#  ", "###", "  #", "###"],
-        &["###", "#  ", "###", "# #", "###"],
-        &["###", "  #", "  #", "  #", "  #"],
-        &["###", "# #", "###", "# #", "###"],
-        &["###", "# #", "###", "  #", "###"],
-    ];
-    const COLON: [&str; 5] = [" ", "#", " ", "#", " "];
-    let now = Local::now();
-    let time_str = now.format("%H:%M:%S").to_string();
-    let total_w: u16 = time_str.chars().map(|c| if c == ':' { 2 } else { 4 }).sum::<u16>() - 1;
+    let total_w = clock_text_width(time_str);
     let total_h: u16 = 5;
-    if area.width < total_w || area.height < total_h { return; }
+    // Clock mode owns the whole pane, as in tmux: `window_clock_draw_screen`
+    // clears the screen before drawing, so none of the pane's own content
+    // (its prompt, its output) shows around the digits.
+    f.render_widget(Clear, area);
+    let fill_style = window_content_fill_style(window_style);
+    f.render_widget(Block::default().style(fill_style), area);
+    let glyph_style = fill_style.fg(colour);
+    if area.width < total_w || area.height < total_h {
+        // Too small for the big digits: tmux falls back to the plain time,
+        // centred, when it fits at all (window-clock.c:267-276 at tag 3.8,
+        // which centres as width / 2 - len / 2).
+        let w = time_str.len() as u16;
+        if area.width >= w && area.height >= 1 {
+            let x = area.x + area.width / 2 - w / 2;
+            let y = area.y + area.height / 2;
+            let s = Span::styled(time_str.to_string(), glyph_style);
+            f.render_widget(Paragraph::new(Line::from(s)), Rect::new(x, y, w, 1));
+        }
+        return;
+    }
     let start_x = area.x + (area.width.saturating_sub(total_w)) / 2;
     let start_y = area.y + (area.height.saturating_sub(total_h)) / 2;
-    let clock_area = Rect::new(start_x.saturating_sub(1), start_y, total_w + 2, total_h);
-    f.render_widget(Clear, clock_area);
-    let fill_style = window_content_fill_style(window_style);
-    f.render_widget(Block::default().style(fill_style), clock_area);
-    let glyph_style = fill_style.fg(colour);
     for row in 0..5u16 {
         let mut x = start_x;
-        for ch in time_str.chars() {
-            if ch == ':' {
-                let cell_area = Rect::new(x, start_y + row, 1, 1);
-                let s = Span::styled(COLON[row as usize], glyph_style);
-                f.render_widget(Paragraph::new(Line::from(s)), cell_area);
-                x += 2;
-            } else if let Some(d) = ch.to_digit(10) {
-                let pattern = DIGITS[d as usize][row as usize];
-                let cell_area = Rect::new(x, start_y + row, 3, 1);
+        for glyph in time_str.chars().filter_map(clock_glyph) {
+            let pattern = glyph[row as usize];
+            let w = pattern.len() as u16;
+            if pattern.contains('#') {
+                let cell_area = Rect::new(x, start_y + row, w, 1);
                 let s = Span::styled(pattern, glyph_style);
                 f.render_widget(Paragraph::new(Line::from(s)), cell_area);
-                x += 4;
             }
+            x += w + 1;
         }
     }
 }
@@ -1780,11 +1985,14 @@ pub(crate) fn render_float_overlays(
             complete_pane_border_colors(pane_border_style.patch(crate::style::parse_tmux_style(own_border)))
         };
         let window_style = window_styles.for_pane(fl.focused);
-        let window_style = if fl.style.is_empty() {
-            window_style
-        } else {
-            Some(window_style.unwrap_or_default().patch(crate::style::parse_tmux_style(&fl.style)))
+        let float_style = (!fl.style.is_empty()).then(|| crate::style::parse_tmux_style(&fl.style));
+        let window_style = match float_style {
+            None => window_style,
+            Some(own) => Some(window_style.unwrap_or_default().patch(own)),
         };
+        let window_style = window_styles.with_program_colours(
+            window_style, fl.focused, float_style, fl.default_colours.as_ref(),
+        );
         let window_dim = window_styles.dim_for_pane(fl.focused);
         // Paths that paint straight from the window style take it pre dimmed;
         // `apply_window_content_style` dims the cell colours itself.
@@ -1975,6 +2183,43 @@ impl WindowContentStyles {
         } else {
             self.inactive
         }
+    }
+
+    /// A pane's content style (`style`, from [`Self::for_pane`] and a float's
+    /// own `-s` style, `float_style`) with the default colours the program
+    /// set (`OSC 10` and `OSC 11`) put in. tmux's `tty_default_colours`
+    /// (tty.c:3164 at tag 3.8) starts the cached styles from them
+    /// (`tty_window_default_style`, tty.c:3132), so the active pane is drawn
+    /// with `window-active-style`, then the program's colour, then
+    /// `window-style`, and any other pane with `window-style`, then the
+    /// program's colour.
+    pub(crate) fn with_program_colours(
+        self,
+        style: Option<Style>,
+        active: bool,
+        float_style: Option<Style>,
+        program: Option<&[Option<String>; 2]>,
+    ) -> Option<Style> {
+        let Some([fg, bg]) = program else { return style };
+        let layer = if active { self.active } else { self.inactive };
+        let names = |c: &Color| *c != Color::Reset;
+        let over = |pick: fn(&Style) -> Option<Color>| {
+            float_style.as_ref().and_then(pick).filter(names)
+                .or_else(|| layer.as_ref().and_then(pick).filter(names))
+        };
+        let colour = |c: &Option<String>| c.as_deref().map(crate::style::map_color);
+        let mut out = style.unwrap_or_default();
+        if let Some(c) = colour(fg) {
+            if over(|s| s.fg).is_none() {
+                out.fg = Some(c);
+            }
+        }
+        if let Some(c) = colour(bg) {
+            if over(|s| s.bg).is_none() {
+                out.bg = Some(c);
+            }
+        }
+        Some(out)
     }
 
     /// The `dim` percentage for a pane.
@@ -2291,7 +2536,7 @@ pub fn render_layout_json(
     border_style: Style,
     active_border_style: Style,
     clock_mode: bool,
-    clock_colour: Color,
+    clock_look: impl Into<ClockLook>,
     active_rect: Option<Rect>,
     mode_style_str: &str,
     zoomed: bool,
@@ -2303,6 +2548,7 @@ pub fn render_layout_json(
     window_styles: WindowContentStyles,
     border_indicators: PaneBorderIndicators,
 ) {
+    let clock_look = clock_look.into();
     let border_style = complete_pane_border_colors(border_style);
     let active_border_style = complete_pane_border_colors(active_border_style);
     match node {
@@ -2316,6 +2562,8 @@ pub fn render_layout_json(
             wants_mouse: _,
             hide_cursor: _,
             cursor_shape: _,
+            cursor_colour: _,
+            default_colours,
             active,
             copy_mode,
             scroll_offset,
@@ -2334,8 +2582,11 @@ pub fn render_layout_json(
             // into FRAME_SIXELS for the post-draw emit path (M6).
             images,
             copy_hl,
+            clock,
         } => {
-            let window_style = window_styles.for_pane(*active);
+            let window_style = window_styles.with_program_colours(
+                window_styles.for_pane(*active), *active, None, default_colours.as_ref(),
+            );
             let hl_styles = copy_ln.map(|cfg| cfg.hl).unwrap_or_default();
             let window_dim = window_styles.dim_for_pane(*active);
             // Paths that paint straight from the window style take it pre
@@ -2400,6 +2651,10 @@ pub fn render_layout_json(
                     let row = &content[r as usize];
                     let max_c = inner.width.min(row.len() as u16);
                     let mut c: u16 = 0;
+                    // OSC 8 run being collected on this row (#1030): the
+                    // linked cells drawn from `content` get the same overlay
+                    // the `rows_v2` branch gives its linked runs.
+                    let mut link_run: Option<HyperlinkRun> = None;
                     while c < max_c {
                         let cell = &row[c as usize];
                         let mut fg = map_color(&cell.fg);
@@ -2458,9 +2713,27 @@ pub fn render_layout_json(
                         });
                         let char_width = vt100::str_width(&text) as u16;
                         if char_width >= 2 && c + char_width > max_c {
+                            if let Some(done) = link_run.take() { frame_hyperlinks_push(done); }
                             spans.push(Span::styled(" ", style));
                             c += 1;
                         } else {
+                            match (&cell.link, &mut link_run) {
+                                (Some(uri), Some(open))
+                                    if open.uri == *uri && open.style == style =>
+                                {
+                                    open.text.push_str(&text);
+                                }
+                                (Some(uri), _) => {
+                                    if let Some(done) = link_run.take() { frame_hyperlinks_push(done); }
+                                    link_run = Some(HyperlinkRun {
+                                        x: inner.x + c, y: inner.y + r,
+                                        text: text.to_string(), uri: uri.clone(), style,
+                                    });
+                                }
+                                (None, _) => {
+                                    if let Some(done) = link_run.take() { frame_hyperlinks_push(done); }
+                                }
+                            }
                             spans.push(Span::styled(text, style));
                             if char_width >= 2 {
                                 c += 2;
@@ -2469,6 +2742,7 @@ pub fn render_layout_json(
                             }
                         }
                     }
+                    if let Some(done) = link_run.take() { frame_hyperlinks_push(done); }
                     if c < inner.width {
                         let last_bg = if !spans.is_empty() {
                             spans.last().unwrap().style.bg.unwrap_or(Color::Reset)
@@ -2628,10 +2902,13 @@ pub fn render_layout_json(
                 }
             }
 
-            if *active && !*copy_mode {
-                if clock_mode {
-                    render_clock_overlay(f, inner, clock_colour, window_fill);
-                }
+            // A pane's own clock (#1058): the server marks every pane in clock
+            // mode, the focused one and the ones the focus has left, as tmux
+            // draws each pane's own mode (window-clock.c keeps a timer per
+            // pane). A server that predates the mark only reports the focused
+            // pane's clock, through `clock_mode`.
+            if !*copy_mode && (*clock || (*active && clock_mode)) {
+                render_clock_overlay(f, inner, clock_look, window_fill);
             }
 
             if *copy_mode && *active {
@@ -2708,7 +2985,7 @@ pub fn render_layout_json(
             if zoomed {
                 if let Some(i) = effective_sizes.iter().position(|&s| s != 0) {
                     if let Some(child) = children.get(i) {
-                        render_layout_json(f, child, area, dim_preds, border_style, active_border_style, clock_mode, clock_colour, active_rect, mode_style_str, zoomed, border_status, border_format, total_panes, bchars, copy_ln, window_styles, border_indicators);
+                        render_layout_json(f, child, area, dim_preds, border_style, active_border_style, clock_mode, clock_look, active_rect, mode_style_str, zoomed, border_status, border_format, total_panes, bchars, copy_ln, window_styles, border_indicators);
                     }
                 }
                 return;
@@ -2718,7 +2995,7 @@ pub fn render_layout_json(
 
             for (i, child) in children.iter().enumerate() {
                 if i < rects.len() {
-                    render_layout_json(f, child, rects[i], dim_preds, border_style, active_border_style, clock_mode, clock_colour, active_rect, mode_style_str, zoomed, border_status, border_format, total_panes, bchars, copy_ln, window_styles, border_indicators);
+                    render_layout_json(f, child, rects[i], dim_preds, border_style, active_border_style, clock_mode, clock_look, active_rect, mode_style_str, zoomed, border_status, border_format, total_panes, bchars, copy_ln, window_styles, border_indicators);
                 }
             }
             // pane-border-lines none: children are drawn, but no separators.
@@ -3252,7 +3529,7 @@ fn install_client_panic_hook() {
             format!(
                 "psmux client pid {} panicked at {}\n\n{info}\n\nBacktrace:\n{bt}",
                 std::process::id(),
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+                crate::strftime::now_string("%Y-%m-%d %H:%M:%S%.3f"),
             ),
         );
         crate::debug_log::reconnect_log("CLIENT PANIC, see client_crash log");
@@ -3445,6 +3722,11 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     // frame; before the first one no prompt can be open.
     let mut word_separators = String::new();
     let mut command_input = false;
+    // `status-keys vi`: whether the command prompt is in vi command mode,
+    // tmux's PROMPT_COMMANDMODE (prompt.c:819 at tag 3.8). Every prompt
+    // opens in insert mode. The option arrives with every frame.
+    let mut prompt_vi_command = false;
+    let mut status_keys_vi = false;
     let mut command_buf = String::new();
     // Characters from the END of `command_buf`, the way the shared prompt
     // editor and the rename overlay count (`copy_mode::prompt_edit`).
@@ -3490,6 +3772,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             let key: bool = !single && !numeric && $key;
             let search: bool = $search;
             command_input = true;
+            prompt_vi_command = false;
             command_buf = initial;
             command_back = 0;
             prompt_saved = None;
@@ -3507,6 +3790,16 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     // Track active window name from last dump-state for #W expansion
     let mut active_window_name = String::new();
 
+    // The chooser search (#1065), tmux's `mtd->search`: `/`, `?` or `C-s`
+    // opens a `(search) ` prompt whose text is `chooser_search_prompt` while
+    // it is being typed; Enter makes it `chooser_search`, which `n` and `N`
+    // repeat until the chooser closes. Each chooser opens with neither.
+    let mut chooser_search_prompt: Option<String> = None;
+    let mut chooser_search: Option<String> = None;
+    // The name each `tree_all` row is searched by: a session's name and a
+    // window's name. A pane row's is empty here, since tmux searches a pane
+    // by the command running in it, which is asked for when a search runs.
+    let mut tree_search_names: Vec<String> = Vec::new();
     let mut tree_chooser = false;
     // The VISIBLE rows of the chooser, which is what tmux calls line_list:
     // the cursor, the renderer, Enter and the jump keys all index this list.
@@ -3547,6 +3840,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     macro_rules! open_buffer_chooser {
         () => {{
             buffer_chooser = true;
+            chooser_search_prompt = None;
+            chooser_search = None;
             buffer_selected = 0;
             buffer_scroll = 0;
             buffer_num_buffer.clear();
@@ -3717,6 +4012,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     let mut paste_seen_len: usize = 0;
     #[cfg(windows)]
     let mut paste_last_growth: Option<Instant> = None;
+    // Keys in a row that reached a stage 2 hold one at a time, each at least
+    // PASTE_TYPED_GAP after the one before (see stage2_key_arrived_alone).
+    #[cfg(windows)]
+    let mut paste_typed_streak: u32 = 0;
     // Set when a paste went out because stage 2 ran quiet.  It keeps a late
     // Ctrl+V Release from reading the clipboard back (that would paste the
     // same text twice), and, unlike paste_suppress_until, it never discards
@@ -3836,8 +4135,15 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     let mut srv_pane_base_index: usize = 0;
     #[allow(unused_assignments)]
     let mut clock_active = false;
+    // Some pane shows a clock, the focused one (`clock_active`) or another.
+    let mut clock_shown = false;
+    // The wall clock second the clock digits were last drawn for.
+    let mut clock_drawn_sec: u64 = u64::MAX;
     #[allow(unused_assignments)]
     let mut clock_colour_str: Option<String> = None;
+    // clock-mode-style as the last frame gave it.
+    #[allow(unused_assignments)]
+    let mut clock_style = crate::clock_style::ClockStyle::default();
 
     // ── Customize-mode overlay state ──
     #[allow(unused_assignments)]
@@ -3951,6 +4257,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         #[serde(default)]
         status_style: Option<String>,
         #[serde(default)]
+        message_command_style: Option<String>,
+        #[serde(default)]
         status_left: Option<String>,
         #[serde(default)]
         status_right: Option<String>,
@@ -4010,6 +4318,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         /// clock-mode-colour (tmux option)
         #[serde(default)]
         clock_colour: Option<String>,
+        /// clock-mode-style (tmux option), sent only when set; a server that
+        /// predates it sends none, which is the default.
+        #[serde(default)]
+        clock_style: Option<String>,
         /// Dynamic key bindings from server
         #[serde(default)]
         bindings: Vec<BindingEntry>,
@@ -4369,9 +4681,17 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     // Last OSC 0 (host terminal title) value emitted to the host terminal.
     // Tracked across iterations so we only re-emit when the title changes.
     let mut last_emitted_host_title: Option<String> = None;
-    // Issue #269: last OSC 9;4 (host terminal progress) value emitted.
-    // Same debounce pattern as host_title.
-    let mut last_emitted_host_progress: Option<String> = None;
+    // Issue #269: last OSC 9;4 (host terminal progress) value seen. Hidden to
+    // begin with, as tmux's zeroed `c->progress_bar`, so a pane that never set
+    // one writes nothing at attach. It belongs to the client, not to one
+    // server, so it carries over a switch-client to another session, which
+    // then clears a bar the old session left (tmux keeps `c->progress_bar`
+    // across `server_client_set_session`).
+    let mut last_emitted_host_progress = LAST_HOST_PROGRESS
+        .lock()
+        .ok()
+        .and_then(|last| last.clone())
+        .unwrap_or_else(|| String::from("0;0"));
     // ── Sixel graphics (#431) ───────────────────────────────────────
     // Session-lifetime blob cache: image id -> decoded raw ESC P..ST bytes.
     // Blobs are shipped ONCE per id in the dump-state `image_blobs` map, so
@@ -4409,12 +4729,19 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     // sent. tmux keeps the same latch and the same rule in
     // `tty_update_cursor` (tty.c): for `SCREEN_CURSOR_DEFAULT` it sends `Se`,
     // or `Ss 0`, only `if (tty->cstyle != SCREEN_CURSOR_DEFAULT)`.
-    let mut last_cursor_style: u8 = 0;
+    //
+    // After `switch-client` it is what the session left behind, the shape
+    // the terminal is still drawing, so a session with none gets the reset.
+    let mut last_cursor_style: u8 = crate::rendering::last_cursor_code();
+    // The cursor colour last written, `None` for the terminal's own, which is
+    // where it starts, as tmux's `tty->ccolour` starts at -1 (tty.c:114).
+    // After `switch-client` it is the colour the session left behind.
+    let mut last_cursor_colour: Option<String> = crate::rendering::cursor_colour_at_attach();
     // The blink this client last asserted on its own, through DEC private mode
     // 12, for a `cursor-style` that names no shape. `None` is "said nothing",
     // which is where every client starts and what an unset `cursor-blink`
-    // leaves it at.
-    let mut last_blink_mode: Option<bool> = None;
+    // leaves it at. After `switch-client` it is the blink the session left.
+    let mut last_blink_mode: Option<bool> = crate::rendering::blink_asserted();
     // Open prefix+w's tree chooser and prefix+s's session list. A key
     // binding opens them, and so does the server's CHOOSE-TREE or
     // CHOOSE-SESSION directive, sent when choose-tree runs on the server (the
@@ -4422,6 +4749,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     macro_rules! open_tree_chooser {
         () => {{
             tree_chooser = true;
+            chooser_search_prompt = None;
+            chooser_search = None;
+            tree_search_names.clear();
             tree_entries.clear();
             tree_all.clear();
             tree_collapsed.clear();
@@ -4493,6 +4823,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     tree_all.push((true, usize::MAX, 0,
                         tree_session_header(tree_ns, sess_name, nw, is_current),
                         sess_name.clone()));
+                    tree_search_names.push(crate::session::display_session_name(tree_ns, sess_name).to_string());
                     // Every session's windows carry their panes, as
                     // tmux's window_tree_build_window builds pane items
                     // for every window of every session. Only the
@@ -4506,10 +4837,12 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         tree_all.push((true, *wid, 0,
                             format!("  {}: {}{} ({} panes)", disp, wname, marker, panes.len()),
                             sess_name.clone()));
+                        tree_search_names.push(wname.clone());
                         for (pid, ptitle) in panes {
                             tree_all.push((false, *wid, *pid,
                                 format!("    {}", ptitle),
                                 sess_name.clone()));
+                            tree_search_names.push(String::new());
                         }
                     }
                 }
@@ -4520,8 +4853,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     let marker = if wi.active { "*" } else { "" };
                     if wi.active { tree_selected = tree_all.len(); }
                     tree_all.push((true, wi.id, 0, format!("{}{}", wi.name, marker), current_session.clone()));
+                    tree_search_names.push(wi.name.clone());
                     for pi in &wi.panes {
                         tree_all.push((false, wi.id, pi.id, pi.title.clone(), current_session.clone()));
+                        tree_search_names.push(String::new());
                     }
                 }
             }
@@ -4542,9 +4877,81 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 .unwrap_or(0);
         }};
     }
+    // tmux `mode_tree_search_set` for whichever chooser is open (#1065): walk
+    // from the current row in `$dir` for the next row `chooser_search` hits,
+    // wrapping, and put the cursor on it. No hit leaves the cursor alone.
+    //
+    // What a row is searched by follows each tmux mode's search callback.
+    // The tree (window_tree_search): a session by its name, a window by its
+    // name, a pane by the command running in it, which is asked of that
+    // session's server only once the walk reaches one of its panes, so a
+    // search that stops on a session or window asks nothing. The session
+    // list: the session's name. The buffers (window_buffer_search): the
+    // buffer's name, then its whole content, fetched one buffer at a time.
+    macro_rules! run_chooser_search {
+        ($dir:expr) => {{
+            if let Some(search) = chooser_search.clone() {
+                use crate::choose_tree::{search_hit, search_step, RowKind};
+                let icase = crate::choose_tree::search_ignores_case(&search);
+                let dir: crate::choose_tree::SearchDir = $dir;
+                if tree_chooser {
+                    if let Some(cur) = tree_vis_map.get(tree_selected).copied() {
+                        let mut pane_cmds: std::collections::HashMap<String, std::collections::HashMap<usize, String>> =
+                            std::collections::HashMap::new();
+                        let found = search_step(tree_all.len(), cur, dir, |i| {
+                            let (is_win, wid, pid, _, sess) = &tree_all[i];
+                            match crate::choose_tree::row_kind(*is_win, *wid) {
+                                RowKind::Pane => pane_cmds
+                                    .entry(sess.clone())
+                                    .or_insert_with(|| fetch_session_pane_commands(sess))
+                                    .get(pid)
+                                    .map_or(false, |cmd| search_hit(cmd, &search, icase)),
+                                _ => tree_search_names
+                                    .get(i)
+                                    .map_or(false, |name| search_hit(name, &search, icase)),
+                            }
+                        });
+                        if let Some(t) = found {
+                            let kinds = tree_row_kinds(&tree_all);
+                            crate::choose_tree::expand_ancestors(&kinds, &mut tree_collapsed, t);
+                            let (rows, map) = tree_rebuild_visible(&tree_all, &tree_collapsed);
+                            tree_entries = rows;
+                            tree_vis_map = map;
+                            tree_selected = tree_vis_map.iter().position(|&i| i == t).unwrap_or(tree_selected);
+                        }
+                    }
+                } else if session_chooser {
+                    let shown = session_filtered_indices(&session_entries, &session_filter);
+                    let ns = crate::session::session_namespace(&current_session);
+                    let found = search_step(shown.len(), session_selected, dir, |i| {
+                        session_entries.get(shown[i]).map_or(false, |(base, _)| {
+                            search_hit(crate::session::display_session_name(ns, base), &search, icase)
+                        })
+                    });
+                    if let Some(t) = found {
+                        session_selected = t;
+                        session_num_buffer.clear();
+                    }
+                } else if buffer_chooser {
+                    let found = search_step(buffer_entries.len(), buffer_selected, dir, |i| {
+                        let name = &buffer_entries[i].0;
+                        search_hit(name, &search, icase)
+                            || fetch_buffer_text(port, &session_key, name)
+                                .map_or(false, |text| search_hit(&text, &search, icase))
+                    });
+                    if let Some(t) = found {
+                        buffer_selected = t;
+                        buffer_num_buffer.clear();
+                    }
+                }
+            }
+        }};
+    }
     macro_rules! open_session_chooser {
         () => {{
             session_chooser = true;
+            chooser_search_prompt = None;
+            chooser_search = None;
             session_entries.clear();
             session_selected = 0;
             session_scroll = 0;
@@ -4804,6 +5211,23 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 crate::copy_mode::emit_osc52(&mut std::io::stdout(), &clip_text);
             }
         }
+        if !drained_oneshots.host_events.is_empty() {
+            let mut stdout = std::io::stdout().lock();
+            for event in &drained_oneshots.host_events {
+                let _ = std::io::Write::write_all(&mut stdout, event);
+            }
+            if drained_oneshots.host_raw {
+                let _ = std::io::Write::write_all(&mut stdout, b"\x1b[0m\x1b]8;;\x1b\\");
+            }
+            let _ = std::io::Write::flush(&mut stdout);
+            drop(stdout);
+            if drained_oneshots.host_raw {
+                // Raw passthrough can move the cursor or alter attributes/cells.
+                // Invalidate ratatui's screen before drawing its next snapshot.
+                let _ = terminal.clear();
+                selection_changed = true;
+            }
+        }
         if drained_oneshots.bell {
             let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x07");
             let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -4896,7 +5320,15 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 } else if !paste_stage2 && elapsed > Duration::from_millis(20) {
                     // 20ms window expired
                     let has_non_ascii = paste_pend.chars().any(|c| !c.is_ascii());
-                    if paste_pend.len() >= 3 && !has_non_ascii {
+                    // One key repeated is a held key whose repeats arrived
+                    // together, not a paste (issue #1049), unless a Ctrl+V or
+                    // the clipboard says otherwise. The clipboard is read
+                    // only for a burst of that shape.
+                    let held_key = paste_pend.len() >= 3
+                        && !has_non_ascii
+                        && is_one_key_repeated(&paste_pend)
+                        && !repeated_key_is_a_paste(&paste_pend, paste_gesture.is_open(), paste_clip_head.get());
+                    if paste_pend.len() >= 3 && !has_non_ascii && !held_key {
                         // ≥3 ASCII chars in 20ms → likely paste, enter stage 2.
                         // Non-ASCII chars (IME composition, CJK input) are excluded
                         // because IME routinely generates 3+ chars in <20ms and would
@@ -4941,9 +5373,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         paste_pend.clear();
                         paste_pend_start = None;
                     } else {
-                        // <3 chars → normal typing, flush as send-text
+                        // <3 chars, or a held key → normal typing, flush as send-text
                         if input_log_enabled() {
-                            input_log("paste", &format!("flush {} chars as normal (< 3 in 20ms)", paste_pend.len()));
+                            if held_key {
+                                input_log("paste", &format!("flush {} chars as normal (one key repeated, a held key)", paste_pend.len()));
+                            } else {
+                                input_log("paste", &format!("flush {} chars as normal (< 3 in 20ms)", paste_pend.len()));
+                            }
                         }
                         // Even a 1-2 character burst can be a clipboard paste
                         // ("ab" pasted twice is the same bug as a CJK word), so
@@ -5277,6 +5713,43 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 // and nothing that follows is discarded.
                                 paste_fallback_suppress_until = Some(Instant::now() + Duration::from_millis(200));
                             }
+                            // Typing that stage 2 mistook for a paste. A busy
+                            // machine can leave keys queued until the client
+                            // reads several at once, and that bunch passes the
+                            // 3 in 20 ms test. Stage 2 then held every later key
+                            // until input went quiet for PASTE_STAGE2_QUIET,
+                            // which steady typing never does: a whole line
+                            // appeared at once when the typist paused (sweep
+                            // 2026-11-22, a 1.4 s freeze at 12 ms per key). A
+                            // paste arrives as many characters together, even
+                            // when sshd hands it over in fragments; keys that
+                            // keep arriving one at a time, each a few ms after
+                            // the last, are a person typing. Those go out as
+                            // the keys they are, before this one.
+                            if paste_stage2 && !paste_pend.is_empty() {
+                                if stage2_key_arrived_alone(quiet) {
+                                    paste_typed_streak += 1;
+                                } else {
+                                    paste_typed_streak = 0;
+                                }
+                                if paste_typed_streak >= PASTE_STAGE2_TYPED_STREAK {
+                                    if input_log_enabled() {
+                                        input_log("paste", &format!(
+                                            "stage2 was typing ({} keys arrived one at a time), sending {} chars as keys",
+                                            paste_typed_streak, paste_pend.len()));
+                                    }
+                                    paste_gesture.record(&paste_pend);
+                                    push_pend_as_keys(&paste_pend, &mut cmd_batch);
+                                    paste_pend.clear();
+                                    paste_pend_start = None;
+                                    paste_stage2 = false;
+                                    paste_seen_len = 0;
+                                    paste_last_growth = None;
+                                    paste_typed_streak = 0;
+                                }
+                            } else {
+                                paste_typed_streak = 0;
+                            }
                             // The key that opens a pending group decides whether
                             // its head is a shifted character (issue #766).
                             if paste_pend.is_empty() {
@@ -5313,6 +5786,33 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 if !is_bufferable {
                                     flush_paste_pend_as_text(&mut paste_pend, &mut paste_pend_start, &mut paste_stage2, &mut cmd_batch, &mut paste_gesture);
                                 }
+                            }
+                        }
+                        // `status-keys vi` at the command prompt: Escape enters
+                        // command mode instead of closing the prompt, and there
+                        // a key is a vi command, as tmux's prompt_translate_key
+                        // turns it into an editing key (prompt.c:784 to :930
+                        // at tag 3.8). What it becomes goes on through the
+                        // prompt's arms below like any key typed there.
+                        if command_input && status_keys_vi && !command_key_answer && !command_single && !command_numeric {
+                            let was = prompt_vi_command;
+                            match vi_prompt_key(&mut prompt_vi_command, key.code, key.modifiers) {
+                                ViPromptKey::Key(code, mods) => {
+                                    key.code = code;
+                                    key.modifiers = mods;
+                                }
+                                ViPromptKey::Edit(name) => {
+                                    let _ = crate::copy_mode::prompt_edit(&mut command_buf, &mut command_back, &mut prompt_saved, &word_separators, name, || None);
+                                    key.code = KeyCode::Null;
+                                    key.modifiers = KeyModifiers::NONE;
+                                }
+                                ViPromptKey::Done => {
+                                    key.code = KeyCode::Null;
+                                    key.modifiers = KeyModifiers::NONE;
+                                }
+                            }
+                            if was != prompt_vi_command {
+                                selection_changed = true;
                             }
                         }
                         // Dynamic prefix key check (default: Ctrl+B, configurable via .psmux.conf)
@@ -5586,6 +6086,53 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     cmd_batch.push(format!("{}\n", pending.command));
                                 }
                             }
+                        }
+                        // A chooser's `(search) ` prompt (#1065) takes every key
+                        // while it is open, the prefix and Escape included, as
+                        // tmux's status prompt does (it sees a key before any
+                        // key table). Enter runs the search forward from the
+                        // current row, and an empty Enter or Escape drops the
+                        // search: tmux's callback frees `mtd->search` when the
+                        // text is empty or the prompt was cancelled
+                        // (mode-tree.c:1304-1306). The chooser stays open.
+                        else if chooser_search_prompt.is_some()
+                            && (tree_chooser || session_chooser || buffer_chooser)
+                            && chooser_kill.is_none()
+                        {
+                            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                            let alt = key.modifiers.contains(KeyModifiers::ALT);
+                            match key.code {
+                                KeyCode::Esc => {
+                                    chooser_search_prompt = None;
+                                    chooser_search = None;
+                                }
+                                KeyCode::Char(c) if ctrl && !alt && (c.eq_ignore_ascii_case(&'c') || c.eq_ignore_ascii_case(&'g')) => {
+                                    chooser_search_prompt = None;
+                                    chooser_search = None;
+                                }
+                                KeyCode::Enter => {
+                                    let typed = chooser_search_prompt.take().unwrap_or_default();
+                                    if typed.is_empty() {
+                                        chooser_search = None;
+                                    } else {
+                                        chooser_search = Some(typed);
+                                        run_chooser_search!(crate::choose_tree::SearchDir::Forward);
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    if let Some(p) = chooser_search_prompt.as_mut() { p.pop(); }
+                                }
+                                KeyCode::Char(c) if ctrl && !alt && c.eq_ignore_ascii_case(&'u') => {
+                                    if let Some(p) = chooser_search_prompt.as_mut() { p.clear(); }
+                                }
+                                KeyCode::Char(c) if !ctrl && !alt && !paste_suppress_until.map_or(false, |t| Instant::now() < t) => {
+                                    if let Some(p) = chooser_search_prompt.as_mut() {
+                                        if p.len() < 256 { p.push(c); }
+                                    }
+                                }
+                                _ => {}
+                            }
+                            selection_changed = true;
                         }
                         // A `-k` prompt is answered by Escape like any other
                         // key ("Escape", status.c:1438), so it is left to the
@@ -5978,7 +6525,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 // because the `.` fallback below sets one and
                                 // this table is read before the first state dump
                                 // has a chance to rebuild either prompt.
-                                KeyCode::Char(':') => { command_input = true; command_buf.clear(); command_back = 0; prompt_saved = None; command_history_idx = command_history.len(); command_template = None; command_prompt_label = None; command_key_answer = false; command_single = false; }
+                                KeyCode::Char(':') => { command_input = true; prompt_vi_command = false; command_buf.clear(); command_back = 0; prompt_saved = None; command_history_idx = command_history.len(); command_template = None; command_prompt_label = None; command_key_answer = false; command_single = false; }
                                 // Same command as the PREFIX_DEFAULTS entry for
                                 // `'`, for the moment before the first state
                                 // sync arrives.
@@ -5991,6 +6538,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 // before the first state sync arrives.
                                 KeyCode::Char('.') => {
                                     command_input = true;
+                                    prompt_vi_command = false;
                                     command_buf.clear();
                                     command_back = 0;
                                     prompt_saved = None;
@@ -6304,6 +6852,22 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                                 }
                                             }
                                         }
+                                    }
+                                }
+                                // `/`, `?` or `C-s` opens the `(search) ` prompt and
+                                // `n` / `N` repeat the last search forward and
+                                // backward (#1065, mode-tree.c:1769-1784). A session
+                                // filter being typed keeps these as its text.
+                                code if (tree_chooser || session_chooser || buffer_chooser)
+                                    && !filter_typing
+                                    && crate::choose_tree::opens_search(code, key.modifiers) => {
+                                    chooser_search_prompt = Some(String::new());
+                                }
+                                code if (tree_chooser || session_chooser || buffer_chooser)
+                                    && !filter_typing
+                                    && crate::choose_tree::repeat_search(code, key.modifiers).is_some() => {
+                                    if let Some(dir) = crate::choose_tree::repeat_search(code, key.modifiers) {
+                                        run_chooser_search!(dir);
                                     }
                                 }
                                 // `q` or `C-g`: the mode exits, as Escape does.
@@ -7301,11 +7865,25 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         // Route paste into the active client-side text overlay
                         // (issue #290) so it does not leak past the command
                         // prompt / rename prompts into the underlying pane.
-                        let consumed = route_paste_to_overlay(
-                            &data,
-                            command_input, &mut command_buf, command_back,
-                            renaming, &mut rename_buf,
-                        );
+                        let consumed = match chooser_search_prompt.as_mut() {
+                            // A chooser's search prompt is a text overlay too
+                            // (#1065): the paste is its text, up to the first
+                            // line end, and never reaches the pane.
+                            Some(p) if tree_chooser || session_chooser || buffer_chooser => {
+                                let line = data.split(['\r', '\n']).next().unwrap_or("");
+                                for c in line.chars().filter(|c| !c.is_control()) {
+                                    if p.len() >= 256 { break; }
+                                    p.push(c);
+                                }
+                                selection_changed = true;
+                                true
+                            }
+                            _ => route_paste_to_overlay(
+                                &data,
+                                command_input, &mut command_buf, command_back,
+                                renaming, &mut rename_buf,
+                            ),
+                        };
                         let duplicate = !consumed && paste_event_is_duplicate(&paste_gesture, &data);
                         if duplicate {
                             // Windows crossterm can emit Event::Paste *and* the
@@ -7915,10 +8493,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                             // First drag of the gesture: enter copy mode and
                                             // replay the press so the selection anchors where
                                             // the button went down, like tmux's
-                                            // MouseDragStart -> copy-mode -M.
+                                            // MouseDragStart -> copy-mode -M. The server
+                                            // already counted this press when the button
+                                            // went down, so it goes as a replay (R) that
+                                            // the click timer skips (#1031).
                                             cmd_batch.push("copy-enter\n".into());
                                             client_drawn_sel = None; // a new gesture: nothing painted yet
-                                            cmd_batch.push(format!("pane-mouse {} 0 {} {} M\n", pending_id, pending_col, pending_row));
+                                            cmd_batch.push(copy_drag_replay_press(pending_id, pending_col, pending_row));
                                             copy_drag_pane = Some((pending_id, pending_rect));
                                         }
                                         // Route the drag to the pane it started in (falling
@@ -8377,6 +8958,20 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     }
                                 }
                             }
+                            // Horizontal wheel (#1036): tmux's MouseDown6Pane /
+                            // MouseDown7Pane, resolved by the server. Never a
+                            // scroll; outside a pane there is nothing to do.
+                            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {
+                                if let Some(&(pane_id, pane_rect)) = client_pane_rects.iter().find(|(_, r)| {
+                                    r.contains(ratatui::layout::Position { x: me.column, y: me.row })
+                                }) {
+                                    let rel_col = me.column as i16 - pane_rect.x as i16;
+                                    let rel_row = (me.row as i16 - pane_content_inner(pane_rect, &client_border_status, &client_border_format).y as i16).max(0);
+                                    let dir = if me.kind == MouseEventKind::ScrollRight { "right" } else { "left" };
+                                    cmd_batch.push(format!("pane-hwheel {} {} {} {} {}\n", pane_id, dir, rel_col, rel_row,
+                                        crate::mouse_keys::sgr_mod_bits(me.modifiers)));
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -8426,10 +9021,28 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 && !paste_confirmed
                 && !paste_stage2
             {
+                // Measured BEFORE the clipboard read: the hold is how long the
+                // character has waited for a follow up, and the read is not
+                // input gap.  The first read on this thread creates the owner
+                // window clipboard.rs opens the clipboard with, a few ms, and
+                // counting that against the 3 ms PASTE_HEAD_PREFIX_HOLD
+                // released the head of a paste as typing (test_altgr_letter_paste
+                // 'bi' before ESC[200~, test_issue684_paste_head 40 flushes).
+                let head_cache = &mut paste_clip_head;
+                let read_started = Instant::now();
+                let (held_for, (clip_head, clip_busy)) = held_for_then_read(paste_pend_start, move || head_cache.get_state());
+                // Nor is it input gap for the 20 ms window that the top of
+                // the loop measures from paste_pend_start: a busy clipboard
+                // read retries for 10 to 15 ms, and two of them used the
+                // window up while the rest of the paste sat unread in the
+                // console input buffer ('bi' flushed as typing, then 'r
+                // sonraki...' pasted on its own).
+                paste_pend_start = shift_pend_start_past_read(paste_pend_start, read_started.elapsed());
                 PasteHeadEvidence {
                     gesture_open: paste_gesture.is_open(),
-                    clip_head: paste_clip_head.get(),
-                    held_for: paste_pend_start.map(|s| s.elapsed()).unwrap_or_default(),
+                    clip_head,
+                    clip_busy,
+                    held_for,
                     shifted_head: paste_head_shifted,
                     head_released: paste_head_released || !key_releases_seen || !release_shape_is_evidence,
                 }
@@ -8481,8 +9094,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     let gesture = evidence.gesture_open;
                     let prefix = evidence.clipboard_starts_with(&paste_pend);
                     let shifted = evidence.shifted_head && paste_pend.chars().count() == 1;
-                    let why = if gesture || prefix || shifted {
-                        format!("head of a paste (ctrl-v gesture={}, clipboard prefix={}, shifted head={})", gesture, prefix, shifted)
+                    let busy = evidence.clip_busy;
+                    let why = if gesture || prefix || shifted || busy {
+                        format!("head of a paste (ctrl-v gesture={}, clipboard prefix={}, shifted head={}, clipboard busy={})", gesture, prefix, shifted, busy)
                     } else {
                         "newline or tab never takes the zero latency path".to_string()
                     };
@@ -8717,7 +9331,12 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         // Rate-limit dump-state requests to avoid flooding the server.
         // dump_in_flight prevents >1 concurrent request; the interval check
         // ensures we don't re-request faster than ~100fps when typing.
-        let overlays_active = command_input || renaming || tree_chooser || buffer_chooser || session_chooser || keys_viewer || confirm_cmd.is_some() || srv_popup_active || srv_confirm_active || srv_menu_active || srv_display_panes || clock_active;
+        let overlays_active = command_input || renaming || tree_chooser || buffer_chooser || session_chooser || keys_viewer || confirm_cmd.is_some() || srv_popup_active || srv_confirm_active || srv_menu_active || srv_display_panes;
+        // A clock on screen redraws when its second changes, as tmux's
+        // window_clock_timer_callback does, not on every pass of this loop:
+        // counted as an overlay it re-rendered the whole frame on every pass,
+        // 6 to 7% of a core while a clock sat beside the pane being typed in.
+        let clock_tick = clock_redraw_due(clock_active || clock_shown, &mut clock_drawn_sec);
         // An overlay that closes without the server changing anything (n at
         // `kill-pane? (y/n)`, Escape out of a prompt) leaves no new frame to
         // draw, and the skip checks below used to `continue` on exactly that
@@ -8761,13 +9380,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         // ── STEP 3: Render if we have a frame ────────────────────────────
         // Also render if selection changed (for highlight overlay) even without new frame
         // Always render when overlays are active (command prompt, rename, choosers)
-        if !got_frame && !selection_changed && !overlays_active && !overlay_closed {
+        if !got_frame && !selection_changed && !overlays_active && !overlay_closed && !clock_tick {
             continue;
         }
 
         // Skip parse + render when the raw JSON is identical to the previous
         // frame AND selection hasn't changed AND no overlays are active.
-        if dump_buf == prev_dump_buf && !selection_changed && !overlays_active && !overlay_closed {
+        if dump_buf == prev_dump_buf && !selection_changed && !overlays_active && !overlay_closed && !clock_tick {
             last_dump_time = Instant::now();
             continue;
         }
@@ -8834,7 +9453,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         client_zoomed = state.zoomed;
         let dim_preds = state.prediction_dimming;
         clock_active = state.clock_mode;
+        clock_shown = layout_shows_clock(&root);
         clock_colour_str = state.clock_colour;
+        clock_style = state
+            .clock_style
+            .as_deref()
+            .and_then(crate::clock_style::ClockStyle::parse)
+            .unwrap_or_default();
         let state_cursor_style_code = state.cursor_style_code;
         let state_cursor_blink_mode = state.cursor_blink_mode;
         // Server-side overlay state (update persistent variables)
@@ -8951,8 +9576,25 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         // new OSC 0 sequence if it has changed.  Stored as a local so
         // it survives `state` being moved into its other fields below.
         let host_title_this_frame: Option<String> = state.host_title.clone();
-        // Issue #269: capture host_progress for post-draw OSC 9;4 emit.
-        let host_progress_this_frame: Option<String> = state.host_progress.clone();
+        // Issue #269: capture host_progress for the post-draw write. A frame
+        // with none is a pane that never set one, which tmux's zeroed
+        // `base.progress_bar` writes as hidden, so switching to it clears the
+        // terminal (server-client.c:2659 at tag 3.8). The options ride on the
+        // frame, and are read only when the value changes.
+        // A frame with no change compares one short string and allocates
+        // nothing.
+        let host_progress_this_frame = state.host_progress.as_deref().unwrap_or("0;0");
+        let host_progress_change = if host_progress_this_frame != last_emitted_host_progress {
+            let sequence = crate::terminal_overrides::progress_sequence(
+                state.client_render_options.terminal_features.as_deref(),
+                state.client_render_options.terminal_overrides.as_deref().unwrap_or(&[]),
+                &crate::terminal_overrides::client_term(),
+                host_progress_this_frame,
+            );
+            Some((host_progress_this_frame.to_string(), sequence))
+        } else {
+            None
+        };
 
         // Update prefix key from server config (if provided)
         if let Some(ref prefix_str) = state.prefix {
@@ -9076,6 +9718,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         if let Some(seps) = state.client_render_options.word_separators.as_ref() {
             word_separators.clone_from(seps);
         }
+        status_keys_vi = state.client_render_options.status_keys_vi.unwrap_or(false);
         // Update status-left / status-right from server (already format-expanded)
         if let Some(sl) = state.status_left {
             // Pass full string — visual truncation is handled by ratatui
@@ -9191,7 +9834,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             collect_layout_borders(&root, content_chunk, &mut border_path, &mut client_borders);
 
             let active_rect = compute_active_rect_json_zoom_aware(&root, content_chunk, state.zoomed);
-            let clock_col = clock_colour_str.as_deref().map(|s| map_color(s)).unwrap_or(Color::Cyan);
+            let clock_col = ClockLook {
+                colour: clock_colour_str.as_deref().map(|s| map_color(s)).unwrap_or(Color::Cyan),
+                style: clock_style,
+            };
             let border_status = state.pane_border_status.as_deref().unwrap_or("off");
             // tmux defaults pane-border-format to a non-empty value, so enabling
             // pane-border-status alone renders the pane title. Match that default
@@ -9398,7 +10044,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 // is ON expand to 85x75% so the right-side preview has room.
                 let jump_rows: u16 = if session_num_buffer.is_empty() { 0 } else { 2 };
                 let filter_rows: u16 = if session_filter_active { 2 } else { 0 };
-                let buffer_rows = jump_rows.saturating_add(filter_rows);
+                // The `(search) ` prompt (#1065) takes two rows like the filter.
+                let search_rows: u16 = if chooser_search_prompt.is_some() { 2 } else { 0 };
+                let buffer_rows = jump_rows.saturating_add(filter_rows).saturating_add(search_rows);
                 let avail_w = content_chunk.width;
                 let avail_h = content_chunk.height;
                 let (popup_w, popup_h) = if preview_enabled {
@@ -9428,9 +10076,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 };
                 popup_rect_last = Some(oa);
                 let title = if preview_enabled {
-                    " choose-session (f=filter, digits+enter=jump, enter=switch, x=kill, p=preview, esc=clear/close, drag border to move) "
+                    " choose-session (f=filter, digits+enter=jump, /=search, enter=switch, x=kill, p=preview, esc=clear/close, drag border to move) "
                 } else {
-                    " choose-session (f=filter, digits+enter=jump, enter=switch, x=kill, p=preview, esc=clear/close) "
+                    " choose-session (f=filter, digits+enter=jump, /=search, enter=switch, x=kill, p=preview, esc=clear/close) "
                 };
                 let overlay = Block::default().borders(Borders::ALL).title(title).border_style(sel_style);
                 f.render_widget(Clear, oa);
@@ -9496,6 +10144,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         format!("Filter: {}", session_filter),
                         sel_style,
                     )));
+                }
+                if let Some(typed) = &chooser_search_prompt {
+                    lines.push(Line::from(""));
+                    lines.push(chooser_search_prompt_line(typed, sel_style));
                 }
                 let para = Paragraph::new(Text::from(lines));
                 f.render_widget(para, list_area);
@@ -9613,7 +10265,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 // is ON expand to 85x75% so the right-side preview has room.
                 // No digit accumulator any more: a jump key acts on the keystroke,
                 // so the chooser never reserves rows for a pending "go to N".
-                let buffer_rows: u16 = 0;
+                // Only the `(search) ` prompt (#1065) reserves rows, while open.
+                let buffer_rows: u16 = if chooser_search_prompt.is_some() { 2 } else { 0 };
                 let avail_w = content_chunk.width;
                 let avail_h = content_chunk.height;
                 let (popup_w, popup_h) = if preview_enabled {
@@ -9642,9 +10295,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 };
                 popup_rect_last = Some(oa);
                 let title = if preview_enabled {
-                    " choose-tree (0-9=jump  Enter=switch  Left/Right=collapse/expand  p=preview  Esc=close  drag border to move) "
+                    " choose-tree (0-9=jump  Enter=switch  Left/Right=collapse/expand  /=search n/N=next/prev  p=preview  Esc=close  drag border to move) "
                 } else {
-                    " choose-tree (0-9=jump  Enter=switch  Left/Right=collapse/expand  p=preview  Esc=close) "
+                    " choose-tree (0-9=jump  Enter=switch  Left/Right=collapse/expand  /=search n/N=next/prev  p=preview  Esc=close) "
                 };
                 let overlay = Block::default().borders(Borders::ALL).title(title).border_style(sel_style);
                 f.render_widget(Clear, oa);
@@ -9709,6 +10362,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         Line::from(row)
                     };
                     lines.push(line);
+                }
+                if let Some(typed) = &chooser_search_prompt {
+                    lines.push(Line::from(""));
+                    lines.push(chooser_search_prompt_line(typed, sel_style));
                 }
                 let para = Paragraph::new(Text::from(lines));
                 f.render_widget(para, list_area);
@@ -9811,9 +10468,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             if buffer_chooser {
                 let sel_style = crate::style::parse_tmux_style(&mode_style_str);
                 let overlay = Block::default().borders(Borders::ALL)
-                    .title(" choose-buffer (digits+enter=jump, Enter=paste, d=delete, q/Esc=close) ")
+                    .title(" choose-buffer (digits+enter=jump, /=search, Enter=paste, d=delete, q/Esc=close) ")
                     .border_style(sel_style);
-                let buffer_rows: u16 = if buffer_num_buffer.is_empty() { 0 } else { 2 };
+                let buffer_rows: u16 = (if buffer_num_buffer.is_empty() { 0 } else { 2 })
+                    + (if chooser_search_prompt.is_some() { 2 } else { 0 });
                 let buf_h = ((buffer_entries.len() as u16).saturating_add(2).saturating_add(buffer_rows))
                     .max(5)
                     .min(content_chunk.height.saturating_sub(2));
@@ -9849,6 +10507,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         format!("go to {}", buffer_num_buffer),
                         sel_style,
                     )));
+                }
+                if let Some(typed) = &chooser_search_prompt {
+                    lines.push(Line::from(""));
+                    lines.push(chooser_search_prompt_line(typed, sel_style));
                 }
                 let para = Paragraph::new(Text::from(lines));
                 f.render_widget(para, inner);
@@ -9950,8 +10612,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
 
             // Window tabs (the window list)
             let mut tab_spans_all: Vec<Span> = Vec::new();
-            let mut tab_rel_positions: Vec<(usize, u16, u16)> = Vec::new();
-            let mut tab_cursor: u16 = 0;
+            let mut tab_rel_positions: Vec<(usize, usize, usize)> = Vec::new();
+            let mut tab_cursor: usize = 0;
             for (i, w) in windows.iter().enumerate() {
                 let tab_text = if !w.tab_text.is_empty() {
                     w.tab_text.clone()
@@ -9965,7 +10627,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 if i > 0 {
                     // Parse inline styles in separator (e.g. "#[fg=#44475a]|")
                     let sep_spans = crate::style::parse_inline_styles(&win_status_sep, sb_base);
-                    let sep_w: u16 = sep_spans.iter().map(|s| vt100::str_width(s.content.as_ref()) as u16).sum();
+                    let sep_w = crate::style::spans_visual_width(&sep_spans);
                     tab_spans_all.extend(sep_spans);
                     tab_cursor += sep_w;
                 }
@@ -10033,9 +10695,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 } else {
                     normal_style
                 };
+                // A window style's `fg=default` / `bg=default` keeps the status
+                // bar's colour instead of the terminal's (tmux style_parse
+                // resolves `default` against the status line cell).
+                let fallback_style = crate::style::resolve_tab_default_colours(fallback_style, sb_fg, sb_bg);
                 let parsed = crate::style::parse_inline_styles(&tab_text, fallback_style);
                 let tab_start = tab_cursor;
-                let tab_w: u16 = parsed.iter().map(|s| vt100::str_width(s.content.as_ref()) as u16).sum();
+                let tab_w = crate::style::spans_visual_width(&parsed);
                 tab_cursor += tab_w;
                 tab_rel_positions.push((w.idx, tab_start, tab_cursor));
                 tab_spans_all.extend(parsed);
@@ -10058,101 +10724,21 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             crate::style::truncate_spans_to_width(&mut left_spans, state.status_left_length);
             crate::style::truncate_spans_to_width(&mut right_spans, state.status_right_length);
 
-            // Measure widths using Unicode display width
-            let left_w: usize = left_spans.iter().map(|s| vt100::str_width(s.content.as_ref())).sum();
-            let tabs_w: usize = tab_spans_all.iter().map(|s| vt100::str_width(s.content.as_ref())).sum();
-            let right_w: usize = right_spans.iter().map(|s| vt100::str_width(s.content.as_ref())).sum();
             let total_width = status_chunk.width as usize;
-
-            // Assemble final spans based on status-justify
-            let mut status_spans: Vec<Span> = Vec::new();
-            match status_justify_str.as_str() {
-                "centre" | "center" => {
-                    // Centre: [left] [pad1] [tabs] [pad2] [right]
-                    // Tabs are centred in the space between left and right.
-                    let avail = total_width.saturating_sub(left_w).saturating_sub(right_w);
-                    let pad_before = avail.saturating_sub(tabs_w) / 2;
-                    let pad_after = avail.saturating_sub(tabs_w).saturating_sub(pad_before);
-                    status_spans.extend(left_spans);
-                    if pad_before > 0 { status_spans.push(Span::styled(" ".repeat(pad_before), sb_base)); }
-                    status_spans.extend(tab_spans_all);
-                    if pad_after > 0 { status_spans.push(Span::styled(" ".repeat(pad_after), sb_base)); }
-                    status_spans.extend(right_spans);
-                }
-                "absolute-centre" | "absolute-center" => {
-                    // Absolute-centre: tabs centred on the total terminal width
-                    let tabs_start = total_width.saturating_sub(tabs_w) / 2;
-                    status_spans.extend(left_spans);
-                    let pad_before = tabs_start.saturating_sub(left_w);
-                    if pad_before > 0 { status_spans.push(Span::styled(" ".repeat(pad_before), sb_base)); }
-                    status_spans.extend(tab_spans_all);
-                    let used = left_w + pad_before + tabs_w;
-                    let pad_after = total_width.saturating_sub(used).saturating_sub(right_w);
-                    if pad_after > 0 { status_spans.push(Span::styled(" ".repeat(pad_after), sb_base)); }
-                    status_spans.extend(right_spans);
-                }
-                "right" => {
-                    // Right: [left] [pad] [tabs] [right]
-                    status_spans.extend(left_spans);
-                    let used = left_w + tabs_w + right_w;
-                    let pad = total_width.saturating_sub(used);
-                    if pad > 0 { status_spans.push(Span::styled(" ".repeat(pad), sb_base)); }
-                    status_spans.extend(tab_spans_all);
-                    status_spans.extend(right_spans);
-                }
-                _ => {
-                    // Left (default): [left] [tabs] [pad] [right]
-                    status_spans.extend(left_spans);
-                    status_spans.extend(tab_spans_all);
-                    let used = left_w + tabs_w + right_w;
-                    let pad = total_width.saturating_sub(used);
-                    if pad > 0 { status_spans.push(Span::styled(" ".repeat(pad), sb_base)); }
-                    status_spans.extend(right_spans);
-                }
-            }
-            // Compute absolute tab positions based on status-justify layout
-            let tabs_x_offset: u16 = status_chunk.x + match status_justify_str.as_str() {
-                "centre" | "center" => {
-                    let avail = total_width.saturating_sub(left_w).saturating_sub(right_w);
-                    let pad_before = avail.saturating_sub(tabs_w) / 2;
-                    (left_w + pad_before) as u16
-                }
-                "absolute-centre" | "absolute-center" => {
-                    let tabs_start = total_width.saturating_sub(tabs_w) / 2;
-                    tabs_start as u16
-                }
-                "right" => {
-                    let used = left_w + tabs_w + right_w;
-                    let pad = total_width.saturating_sub(used);
-                    (left_w + pad) as u16
-                }
-                _ => left_w as u16, // "left" default
-            };
-            // tmux's default status-format marks status-left range=left, the
-            // window list range=window|N and status-right range=right
-            // (options-table.c OPTIONS_TABLE_STATUS_FORMAT1); this layout
-            // draws the same three parts, so it gets the same ranges.
-            client_status_ranges.clear();
-            if left_w > 0 {
-                client_status_ranges.push((status_chunk.y, crate::style::StatusRangeType::Left,
-                    status_chunk.x, status_chunk.x + left_w.min(total_width) as u16));
-            }
-            client_status_ranges.extend(tab_rel_positions.iter().map(|&(idx, s, e)| {
-                (status_chunk.y, crate::style::StatusRangeType::Window(idx), s + tabs_x_offset, e + tabs_x_offset)
-            }));
-            if right_w > 0 {
-                let tabs_end = (tabs_x_offset - status_chunk.x) as usize + tabs_w;
-                let right_start = total_width.saturating_sub(right_w).max(tabs_end).min(total_width);
-                client_status_ranges.push((status_chunk.y, crate::style::StatusRangeType::Right,
-                    status_chunk.x + right_start as u16, status_chunk.x + total_width as u16));
-            }
+            let layout = layout_default_status_line(
+                left_spans, tab_spans_all, right_spans, &tab_rel_positions,
+                windows.iter().find(|w| w.active).map(|w| w.idx),
+                total_width, &status_justify_str, sb_base,
+            );
+            let status_spans = layout.spans;
+            client_status_ranges = layout.ranges.into_iter().map(|(kind, start, end)| {
+                (status_chunk.y, kind, status_chunk.x + start, status_chunk.x + end)
+            }).collect();
             client_status_fallback_rows.clear();
             client_status_fallback_rows.push(status_chunk.y);
             client_status_row = status_chunk.y;
             client_status_rows = status_chunk.height;
             client_window_indices = windows.iter().map(|w| w.idx).collect();
-            // Truncate overall status line to fit the available width
-            crate::style::truncate_spans_to_width(&mut status_spans, total_width);
             // If a display-message is active, show it on the status bar
             // instead of the normal status content (tmux parity).
             // Uses message-style (default: bg=yellow,fg=black) matching tmux.
@@ -10307,7 +10893,20 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             }
             if command_input {
                 let title = command_prompt_label.as_deref().unwrap_or("command");
-                let overlay = Block::default().borders(Borders::ALL).title(title);
+                // tmux draws its prompt with message-style, and with
+                // message-command-style only in vi command mode
+                // (prompt_effective_style, prompt.c:438 to :450 at tag 3.8;
+                // status_prompt_redraw at 3.5a, status.c:742 to :745).
+                let command_style = crate::style::parse_tmux_style(prompt_style(
+                    prompt_vi_command,
+                    state.message_style.as_deref(),
+                    state.message_command_style.as_deref(),
+                ));
+                let overlay = Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .style(command_style)
+                    .border_style(command_style);
                 let oa = centered_rect(60, 3, content_chunk);
                 f.render_widget(Clear, oa);
                 f.render_widget(&overlay, oa);
@@ -10329,7 +10928,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 let avail = inner.width.saturating_sub(2) as usize; // after ": "
                 let (shown, cur_col) =
                     crate::util::prompt_window(&command_buf, at, avail);
-                let para = Paragraph::new(format!(": {}", shown));
+                let para = Paragraph::new(format!(": {}", shown)).style(command_style);
                 f.render_widget(para, inner);
                 let cx = inner.x + 2 + cur_col as u16;
                 f.set_cursor_position((cx, inner.y));
@@ -10664,6 +11263,17 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             }
             let effective = find_active_cursor_shape(&root)
                 .unwrap_or_else(|| state_cursor_style_code.unwrap_or_else(crate::rendering::configured_cursor_code));
+            fn find_active_cursor_colour(node: &LayoutJson) -> Option<&str> {
+                match node {
+                    LayoutJson::Leaf { active, cursor_colour, .. } => {
+                        if *active { cursor_colour.as_deref() } else { None }
+                    }
+                    LayoutJson::Split { children, .. } => {
+                        children.iter().find_map(find_active_cursor_colour)
+                    }
+                }
+            }
+            let effective_colour = find_active_cursor_colour(&root);
             let content_chunk = {
                 let sz = terminal.size().unwrap_or_default();
                 let constraints = if status_at_top {
@@ -10759,6 +11369,19 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 crate::rendering::note_cursor_code(effective);
                 let _ = terminal.backend_mut().queue_raw(format!("\x1b[{} q", effective).as_bytes());
             }
+            // The cursor colour when it changes, as tmux's
+            // `tty_force_cursor_colour` (tty.c:770 at tag 3.8) writes `Cs` or
+            // `Cr`: `ESC ] 12 ; rgb:rr/gg/bb BEL`, or `ESC ] 112 BEL` for the
+            // terminal's own.
+            if effective_colour != last_cursor_colour.as_deref() {
+                let bytes = match effective_colour.and_then(crate::rendering::cursor_colour_set) {
+                    Some(set) => set,
+                    None => crate::rendering::CURSOR_COLOUR_RESET.to_string(),
+                };
+                crate::rendering::note_cursor_colour(effective_colour.is_some());
+                last_cursor_colour = effective_colour.map(str::to_string);
+                let _ = terminal.backend_mut().queue_raw(bytes.as_bytes());
+            }
             // A shape carries its own blink, so mode 12 is only for the blink
             // on its own: `cursor-blink` set while `cursor-style` names no
             // shape. Written when it changes, so `set -g cursor-blink` takes
@@ -10770,6 +11393,14 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 crate::rendering::note_blink_asserted(want_blink == Some(true));
                 let _ = terminal.backend_mut().queue_raw(
                     if want_blink == Some(true) { b"\x1b[?12h" } else { b"\x1b[?12l" });
+            } else if want_blink.is_none() && effective == 0 && last_blink_mode.is_some() {
+                // Nothing asks for a blink any more (another session after
+                // switch-client, or `cursor-blink` unset): put back the one
+                // the terminal had.
+                last_blink_mode = None;
+                if let Some(on) = crate::rendering::blink_release() {
+                    let _ = terminal.backend_mut().queue_raw(if on { b"\x1b[?12h" } else { b"\x1b[?12l" });
+                }
             }
             let _ = terminal.backend_mut().end_frame();
 
@@ -10811,26 +11442,20 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
 
         // ── Post-draw: forward OSC 9;4 progress (issue #269) ─────────
         // host_progress is "<state>;<value>" e.g. "1;50" (default, 50%) or
-        // "0;0" (hide).  Re-emit ESC ] 9 ; 4 ; <state> ; <value> ESC \ to
-        // the host terminal so Windows Terminal / iTerm2 / kitty render
-        // the progress indicator that the pane app intended.
-        if host_progress_this_frame != last_emitted_host_progress {
-            if let Some(ref prog) = host_progress_this_frame {
-                if let Some((s, v)) = prog.split_once(';') {
-                    if !s.is_empty() && !v.is_empty()
-                        && s.bytes().all(|b| b.is_ascii_digit())
-                        && v.bytes().all(|b| b.is_ascii_digit())
-                    {
-                        use std::io::Write;
-                        let mut out = std::io::stdout().lock();
-                        let _ = out.write_all(b"\x1b]9;4;");
-                        let _ = out.write_all(s.as_bytes());
-                        let _ = out.write_all(b";");
-                        let _ = out.write_all(v.as_bytes());
-                        let _ = out.write_all(b"\x1b\\");
-                        let _ = out.flush();
-                    }
-                }
+        // "0;0" (hide). The bytes are this client's `Spb`, from `terminal-features`
+        // and `terminal-overrides`, ESC ] 9 ; 4 ; <state> ; <value> ESC \ unless
+        // an override changed it, and nothing without one (tty.c:3219 at tag
+        // 3.8). The value counts as seen either way, as tmux keeps it in
+        // `c->progress_bar` before it looks for the capability.
+        if let Some((host_progress_this_frame, sequence)) = host_progress_change {
+            if let Some(sequence) = sequence {
+                use std::io::Write;
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(sequence.as_bytes());
+                let _ = out.flush();
+            }
+            if let Ok(mut last) = LAST_HOST_PROGRESS.lock() {
+                *last = Some(host_progress_this_frame.clone());
             }
             last_emitted_host_progress = host_progress_this_frame;
         }
@@ -10964,7 +11589,11 @@ fn flush_paste_pend_as_text(
     // avoid the 300ms delay (fixes #91).
     gesture.record(paste_pend);
     let has_non_ascii = paste_pend.chars().any(|c| !c.is_ascii());
-    if (*paste_stage2 || paste_pend.len() >= 3) && !has_non_ascii {
+    // A burst that never reached stage 2 and is one key repeated is a held
+    // key (issue #1049), so it goes out as the keys it is. With a Ctrl+V
+    // press in flight it is that paste, as in the 20 ms rule.
+    let held_key = is_one_key_repeated(paste_pend) && !gesture.is_open();
+    if (*paste_stage2 || (paste_pend.len() >= 3 && !held_key)) && !has_non_ascii {
         let encoded = crate::util::base64_encode(paste_pend);
         cmd_batch.push(format!("send-paste {}\n", encoded));
     } else {
@@ -10987,6 +11616,40 @@ fn flush_paste_pend_as_text(
     paste_pend.clear();
     *paste_pend_start = None;
     *paste_stage2 = false;
+}
+
+/// True when `pend` is one character repeated, the shape a held key makes.
+///
+/// Key repeat is paced by the keyboard, 30 ms or so apart, but a network
+/// between the keyboard and the client (ssh) delivers several repeats in one
+/// packet whenever it stalls for a moment. Those arrive inside the 20 ms
+/// window and looked like a paste: holding `j` in Neovim's normal mode typed
+/// `jjjj` into the buffer in place of moving the cursor (issue #1049).
+#[cfg(windows)]
+fn is_one_key_repeated(pend: &str) -> bool {
+    let mut chars = pend.chars();
+    match chars.next() {
+        Some(first) => chars.all(|c| c == first),
+        None => false,
+    }
+}
+
+/// A burst of one repeated character is still a paste when something other
+/// than its timing says so: a Ctrl+V press in flight, or a clipboard that
+/// holds the same run (a pasted `----------`). Behind ssh neither is there,
+/// and a pasted run then reaches the pane as the same characters, typed.
+///
+/// The clipboard head is cut at [`ClipboardHeadCache::HEAD_CHARS`], so a run
+/// longer than the head agrees with it when it continues it.
+#[cfg(windows)]
+fn repeated_key_is_a_paste(pend: &str, gesture_open: bool, clip_head: Option<&str>) -> bool {
+    if gesture_open {
+        return true;
+    }
+    match clip_head {
+        Some(head) => head.chars().count() >= 3 && (head.starts_with(pend) || pend.starts_with(head)),
+        None => false,
+    }
 }
 
 #[cfg(windows)]
@@ -11039,6 +11702,15 @@ struct PasteHeadEvidence<'a> {
     /// prefix of it is the strongest evidence available at the first
     /// character.
     clip_head: Option<&'a str>,
+    /// The clipboard could not be opened (another window held it), so
+    /// `clip_head` is unknown, not empty.
+    ///
+    /// Unknown must not read as "not a paste": a clipboard history listener
+    /// or any NULL owner open held across the first character released the
+    /// head of a paste as typing (`bi` ahead of `ESC[200~` in
+    /// test_altgr_letter_paste, 3 of 5 runs with a second process holding the
+    /// clipboard 40 ms in every 100, 0 of 8 without one).
+    clip_busy: bool,
     /// How long the pending buffer has been held so far.
     held_for: Duration,
     /// The first pending character came with Shift and nothing else.
@@ -11121,9 +11793,68 @@ fn stage2_paste_is_over(held_for: Duration, since_last_char: Duration) -> bool {
 /// `ESC[201~` is parsed as a key (tty-keys.c `tty_keys_paste`). Fragments
 /// of one paste that sshd's ConPTY hands over 20 to 60 ms apart (#598) stay
 /// below the threshold and keep accumulating as before.
+/// The smallest gap before a key that marks it as arriving on its own. A paste
+/// (or one fragment of it) reaches the client as characters microseconds
+/// apart; the fastest typists and key repeat stay above 8 ms per key.
+#[cfg(windows)]
+const PASTE_TYPED_GAP: Duration = Duration::from_millis(5);
+
+/// How many keys in a row must arrive on their own before a stage 2 hold is
+/// taken for typing. The first character of each sshd paste fragment (#598)
+/// arrives alone after a 20 to 60 ms gap, but the rest of the fragment comes
+/// with it, which resets the count.
+#[cfg(windows)]
+const PASTE_STAGE2_TYPED_STREAK: u32 = 3;
+
+/// True when the key now arriving came `since_last_char` after the previous
+/// one, far enough apart to be a key typed on its own rather than the next
+/// character of a paste.
+#[cfg(windows)]
+fn stage2_key_arrived_alone(since_last_char: Duration) -> bool {
+    since_last_char >= PASTE_TYPED_GAP
+}
+
+/// Send `pend` as the keys it was typed as: Enter, Tab and Space by name,
+/// everything else as quoted text.
+#[cfg(windows)]
+fn push_pend_as_keys(pend: &str, cmd_batch: &mut Vec<String>) {
+    for c in pend.chars() {
+        match c {
+            '\n' => cmd_batch.push("send-key enter\n".into()),
+            '\t' => cmd_batch.push("send-key tab\n".into()),
+            ' ' => cmd_batch.push("send-key space\n".into()),
+            '"' => cmd_batch.push("send-text \"\\\"\"\n".into()),
+            '\\' => cmd_batch.push("send-text \"\\\\\"\n".into()),
+            _ => cmd_batch.push(format!("send-text \"{}\"\n", c)),
+        }
+    }
+}
+
 #[cfg(windows)]
 fn stage2_paste_ended_by_new_key(paste_stage2: bool, pend_non_empty: bool, since_last_char: Duration) -> bool {
     paste_stage2 && pend_non_empty && since_last_char >= PASTE_STAGE2_QUIET
+}
+
+/// How long the pending buffer has waited, taken BEFORE `read` runs, and what
+/// `read` returned.
+///
+/// `read` is the clipboard head lookup, which opens the clipboard when its
+/// sequence number moved.  That costs a few milliseconds the first time a
+/// thread does it (clipboard.rs creates the window it opens the clipboard
+/// with), more than PASTE_HEAD_PREFIX_HOLD, so measuring after it released the
+/// head of a paste as typing before the rest of the paste could be read.
+#[cfg(windows)]
+fn held_for_then_read<R>(pend_start: Option<Instant>, read: impl FnOnce() -> R) -> (Duration, R) {
+    let held_for = pend_start.map(|s| s.elapsed()).unwrap_or_default();
+    (held_for, read())
+}
+
+/// The pending buffer's start, moved later by the time the clipboard read
+/// blocked the input loop, so the paste windows count only time in which
+/// input could have been read.  Never moved past now.
+#[cfg(windows)]
+fn shift_pend_start_past_read(pend_start: Option<Instant>, read_took: Duration) -> Option<Instant> {
+    pend_start.map(|s| (s + read_took).min(Instant::now()))
 }
 
 #[cfg(windows)]
@@ -11156,7 +11887,12 @@ impl<'a> PasteHeadEvidence<'a> {
         if self.shifted_head && lone && self.held_for < PASTE_HEAD_PREFIX_HOLD {
             return true;
         }
-        if !self.clipboard_starts_with(pend) {
+        // A busy clipboard gives no answer either way. The characters were
+        // written by a host (a typed one returned above), so they get the
+        // same short hold a matching prefix gets: a paste's next characters
+        // land inside it, and anything else still goes out as typing once it
+        // runs out.
+        if !self.clipboard_starts_with(pend) && !self.clip_busy {
             return false;
         }
         // One character on prefix evidence alone: hold it for
@@ -11206,6 +11942,9 @@ fn should_zero_latency_flush_paste_pend(
 struct ClipboardHeadCache {
     seq: Option<u32>,
     head: Option<String>,
+    /// The last read could not open the clipboard: the head is unknown, which
+    /// is not the same as a clipboard holding no text.
+    busy: bool,
 }
 
 #[cfg(windows)]
@@ -11213,7 +11952,12 @@ impl ClipboardHeadCache {
     const HEAD_CHARS: usize = 64;
 
     fn get(&mut self) -> Option<&str> {
-        self.get_with(
+        self.get_state().0
+    }
+
+    /// The head, and whether it is unknown because the clipboard was busy.
+    fn get_state(&mut self) -> (Option<&str>, bool) {
+        self.state_with(
             crate::clipboard::clipboard_sequence_number(),
             crate::clipboard::try_read_from_system_clipboard,
         )
@@ -11229,11 +11973,26 @@ impl ClipboardHeadCache {
         seq: u32,
         read: impl FnOnce() -> Result<Option<String>, crate::clipboard::ClipboardBusy>,
     ) -> Option<&str> {
+        self.state_with(seq, read).0
+    }
+
+    fn state_with(
+        &mut self,
+        seq: u32,
+        read: impl FnOnce() -> Result<Option<String>, crate::clipboard::ClipboardBusy>,
+    ) -> (Option<&str>, bool) {
         if self.seq != Some(seq) {
-            match read() {
+            let started = Instant::now();
+            let result = read();
+            if input_log_enabled() {
+                input_log("paste", &format!(
+                    "clipboard head read (seq {}) took {} us", seq, started.elapsed().as_micros()));
+            }
+            match result {
                 Ok(text) => {
                     self.seq = Some(seq);
                     self.head = text.map(|t| t.chars().take(Self::HEAD_CHARS).collect::<String>());
+                    self.busy = false;
                 }
                 Err(_) => {
                     if input_log_enabled() {
@@ -11242,10 +12001,11 @@ impl ClipboardHeadCache {
                     }
                     self.seq = None;
                     self.head = None;
+                    self.busy = true;
                 }
             }
         }
-        self.head.as_deref()
+        (self.head.as_deref(), self.busy)
     }
 }
 
@@ -11589,6 +12349,94 @@ pub(crate) enum PromptKeyAction {
 /// prompts and the rename overlay already share, reached by the tmux name of
 /// the key. C-c and C-g cancel tmux's prompt the way Escape does
 /// (`status.c:1671` to `:1674`) and C-[ IS Escape.
+/// The style the command prompt is drawn with: `message-command-style` in vi
+/// command mode, `message-style` otherwise, each falling back to tmux's
+/// default when the server sent none (options-table.c, bg=yellow,fg=black and
+/// bg=black,fg=yellow before tmux 3.8's theme colours).
+pub(crate) fn prompt_style<'a>(vi_command: bool, message_style: Option<&'a str>, message_command_style: Option<&'a str>) -> &'a str {
+    let (set, default) = if vi_command {
+        (message_command_style, "bg=black,fg=yellow")
+    } else {
+        (message_style, "bg=yellow,fg=black")
+    };
+    match set {
+        Some(s) if !s.is_empty() => s,
+        _ => default,
+    }
+}
+
+/// What a key does at the command prompt with `status-keys vi`.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ViPromptKey {
+    /// Handle this key the way the prompt handles a typed key.
+    Key(KeyCode, KeyModifiers),
+    /// Run this prompt editor action (`copy_mode::prompt_edit`) and nothing more.
+    Edit(&'static str),
+    /// Nothing more: a change of mode, or a key command mode has no use for.
+    Done,
+}
+
+/// tmux's prompt_translate_key (prompt.c:784 to :930 at tag 3.8). In insert
+/// mode Escape (or C-[) enters command mode and steps the cursor back one, and
+/// every other key is typed as usual. In command mode a key is a vi command:
+/// `i`, `a`, `A`, `I`, `C`, `s` and `S` go back to insert mode, the motions
+/// and edits become the editing keys they stand for, Enter, C-c and C-h still
+/// work, and anything else does nothing.
+pub(crate) fn vi_prompt_key(command_mode: &mut bool, code: KeyCode, mods: KeyModifiers) -> ViPromptKey {
+    use ViPromptKey::{Done, Edit, Key};
+    let ctrl = mods.contains(KeyModifiers::CONTROL);
+    let escape = matches!(code, KeyCode::Esc) || (ctrl && code == KeyCode::Char('['));
+    if !*command_mode {
+        if escape {
+            *command_mode = true;
+            return Edit("left");
+        }
+        return Key(code, mods);
+    }
+    let ch = match code {
+        KeyCode::Char(c) if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => Some(c),
+        _ => None,
+    };
+    let none = KeyModifiers::NONE;
+    match (code, ch) {
+        (KeyCode::Backspace, _) => return Key(KeyCode::Left, none),
+        (_, Some('A' | 'I' | 'C' | 's' | 'a')) => *command_mode = false,
+        (_, Some('S')) => {
+            *command_mode = false;
+            return Key(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        }
+        (_, Some('i')) => {
+            *command_mode = false;
+            return Done;
+        }
+        _ if escape => return Done,
+        _ => {}
+    }
+    match (code, ch) {
+        (_, Some('A' | '$')) => Key(KeyCode::End, none),
+        (_, Some('I' | '0' | '^')) => Key(KeyCode::Home, none),
+        (_, Some('C' | 'D')) => Key(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        (_, Some('X')) => Key(KeyCode::Backspace, none),
+        (_, Some('b')) => Key(KeyCode::Char('b'), KeyModifiers::ALT),
+        (_, Some('B')) => Edit("vi-bigb"),
+        (_, Some('d')) => Key(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        (_, Some('e')) => Edit("vi-e"),
+        (_, Some('E')) => Edit("vi-bige"),
+        (_, Some('w')) => Edit("vi-w"),
+        (_, Some('W')) => Edit("vi-bigw"),
+        (_, Some('p')) => Key(KeyCode::Char('y'), KeyModifiers::CONTROL),
+        (_, Some('q')) => Key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        (KeyCode::Delete, _) | (_, Some('s' | 'x')) => Key(KeyCode::Delete, none),
+        (KeyCode::Down, _) | (_, Some('j')) => Key(KeyCode::Down, none),
+        (KeyCode::Left, _) | (_, Some('h')) => Key(KeyCode::Left, none),
+        (KeyCode::Right, _) | (_, Some('a' | 'l')) => Key(KeyCode::Right, none),
+        (KeyCode::Up, _) | (_, Some('k')) => Key(KeyCode::Up, none),
+        (KeyCode::Enter, _) => Key(code, mods),
+        (KeyCode::Char('h' | 'c'), _) if ctrl => Key(code, mods),
+        _ => Done,
+    }
+}
+
 pub(crate) fn command_prompt_key(
     buf: &mut String,
     back: &mut usize,
@@ -11678,6 +12526,62 @@ fn fetch_buffer_entries(port: u16, session_key: &str) -> Vec<(String, usize, Str
     .unwrap_or_default()
 }
 
+/// The chooser's `(search) ` prompt line (#1065), tmux's prompt string with
+/// the text typed so far and a cursor after it.
+fn chooser_search_prompt_line(typed: &str, style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("(search) {}", typed), style),
+        Span::styled(" ".to_string(), style.add_modifier(Modifier::REVERSED)),
+    ])
+}
+
+/// The command running in each pane of one session, by pane id, which is what
+/// tmux's tree search matches a pane row against (`osdep_get_name` in
+/// window_tree_search). Asked of that session's own server, the way the tree
+/// asks each server for its rows. Empty when the server does not answer.
+fn fetch_session_pane_commands(base: &str) -> std::collections::HashMap<usize, String> {
+    let port = std::fs::read_to_string(crate::paths::port_file(base))
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok());
+    let key = read_session_key(base).unwrap_or_default();
+    let Some(port) = port else { return std::collections::HashMap::new() };
+    crate::session::fetch_authed_response_multi(
+        &format!("127.0.0.1:{}", port),
+        &key,
+        b"list-panes -s -F \"#{pane_id} #{pane_current_command}\"\n",
+        Duration::from_millis(100),
+        Duration::from_millis(500),
+    )
+    .map(|reply| parse_pane_commands(&reply))
+    .unwrap_or_default()
+}
+
+/// `%<id> <command>` lines into a pane id to command map.
+pub(crate) fn parse_pane_commands(reply: &str) -> std::collections::HashMap<usize, String> {
+    reply
+        .lines()
+        .filter_map(|line| {
+            let (id, cmd) = line.trim_end_matches('\r').split_once(' ')?;
+            let id = id.strip_prefix('%')?.parse::<usize>().ok()?;
+            Some((id, cmd.to_string()))
+        })
+        .collect()
+}
+
+/// One paste buffer's whole content, for the buffer chooser's search, which
+/// tmux matches against the content as well as the name
+/// (window_buffer_search). The chooser's own rows carry only a preview.
+fn fetch_buffer_text(port: u16, session_key: &str, name: &str) -> Option<String> {
+    let cmd = format!("show-buffer -b {}\n", crate::util::quote_arg_if_needed(name));
+    crate::session::fetch_authed_response_multi(
+        &format!("127.0.0.1:{}", port),
+        session_key,
+        cmd.as_bytes(),
+        Duration::from_millis(100),
+        Duration::from_millis(200),
+    )
+}
+
 fn top_paste_buffer(port: u16, session_key: &str) -> Option<String> {
     crate::session::fetch_authed_first_line_raw(
         &format!("127.0.0.1:{}", port),
@@ -11765,8 +12669,20 @@ mod test_issue744_paste_overlay_routing;
 mod test_issue684_clipboard_head_cache;
 
 #[cfg(all(test, windows))]
+#[path = "../tests-rs/test_paste_head_hold_before_read.rs"]
+mod test_paste_head_hold_before_read;
+
+#[cfg(all(test, windows))]
 #[path = "../tests-rs/test_issue766_paste_then_key.rs"]
 mod test_issue766_paste_then_key;
+
+#[cfg(all(test, windows))]
+#[path = "../tests-rs/test_stage2_typing_not_paste.rs"]
+mod test_stage2_typing_not_paste;
+
+#[cfg(all(test, windows))]
+#[path = "../tests-rs/test_issue1049_held_key_burst.rs"]
+mod test_issue1049_held_key_burst;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue858_ctrlv_press.rs"]
@@ -11899,8 +12815,16 @@ pub(crate) fn input_poll_ms(
 mod test_keystroke_echo_window;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_pr1046_clock_overlay_clears_pane.rs"]
+mod test_pr1046_clock_overlay_clears_pane;
+
+#[cfg(test)]
 #[path = "../tests-rs/test_zoom_cursor_rect.rs"]
 mod test_zoom_cursor_rect;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_default_status_overflow.rs"]
+mod test_default_status_overflow;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_pane_border_status_cursor.rs"]
@@ -12001,3 +12925,11 @@ mod test_issue783_prompt_edit_unify;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue839_rename_session_identity.rs"]
 mod test_issue839_rename_session_identity;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_pr1017_prompt_vi_style.rs"]
+mod test_pr1017_prompt_vi_style;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue1065_pane_commands.rs"]
+mod tests_issue1065_pane_commands;

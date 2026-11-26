@@ -20,6 +20,8 @@ thread_local! {
     static PANE_POS_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
     static BUFFER_IDX_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
     static NAMED_BUFFER_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
+    // The command list-commands -F is expanding a row for: name, alias, usage.
+    static COMMAND_LIST_OVERRIDE: RefCell<Option<(String, String, String)>> = const { RefCell::new(None) };
     static CLIENT_OVERRIDE: Cell<Option<u64>> = const { Cell::new(None) };
     // Set while expanding a format the way tmux's format_expand does (no
     // strftime pass). See `expand_format_untimed`.
@@ -187,6 +189,12 @@ pub fn set_named_buffer_override(name: Option<String>) {
     NAMED_BUFFER_OVERRIDE.with(|c| *c.borrow_mut() = name);
 }
 
+/// Set the command for #{command_list_name}, #{command_list_alias} and
+/// #{command_list_usage} while list-commands -F expands its rows.
+pub fn set_command_list_override(entry: Option<(String, String, String)>) {
+    COMMAND_LIST_OVERRIDE.with(|c| *c.borrow_mut() = entry);
+}
+
 // ─────────────────────────── public API ───────────────────────────
 
 /// Expand tmux format strings for the active window.
@@ -219,10 +227,10 @@ fn real_active_idx(app: &AppState) -> usize {
     app.temp_focus_saved_active.unwrap_or(app.active_idx)
 }
 
-/// #{pane_tabs} for a pane `cols` wide: the default tab stops, one every 8
-/// columns from column 8 (tmux screen_reset_tabs), comma separated.
-pub fn pane_tab_stops(cols: u16) -> String {
-    (8..cols).step_by(8).map(|c| c.to_string()).collect::<Vec<_>>().join(",")
+/// #{pane_tabs}: the screen's tab stops, comma separated, as
+/// format_cb_pane_tabs lists them (format.c:1051 at tag 3.8).
+pub fn pane_tab_stops(screen: &vt100::Screen) -> String {
+    screen.tab_stops().map(|c| c.to_string()).collect::<Vec<_>>().join(",")
 }
 
 /// #{window_raw_flags} of window `win_idx` (tmux window_printable_flags).
@@ -384,16 +392,13 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
     }
     // Expand strftime %-sequences only if the ORIGINAL format contained '%'
     if has_strftime && result.contains('%') {
-        // Use write! to catch chrono format errors instead of panicking.
-        // Expanded variable content has '%' escaped to '%%' above, so chrono
-        // will only interpret the real strftime codes from the original format.
-        use std::fmt::Write;
-        let formatted = chrono::Local::now().format(&result);
-        let mut buf = String::with_capacity(result.len() + 32);
-        if write!(buf, "{}", formatted).is_ok() {
+        // A refused format (unknown specifier, lone '%') yields None and the
+        // pre-strftime result is kept as-is, never a panic. Expanded variable
+        // content has '%' escaped to '%%' above, so only the real strftime
+        // codes from the original format are interpreted.
+        if let Some(buf) = crate::strftime::format(&result, &crate::strftime::now()) {
             result = buf;
         }
-        // On error, keep the pre-strftime result as-is
     }
     result
 }
@@ -1064,9 +1069,10 @@ fn apply_modifier(m: &Modifier, value: &str, app: &AppState, win_idx: usize) -> 
     match m {
         Modifier::Time => {
             if let Ok(ts) = value.parse::<i64>() {
-                if let Some(dt) = chrono::DateTime::from_timestamp(ts, 0) {
-                    let local: chrono::DateTime<chrono::Local> = dt.into();
-                    return local.format("%a %b %e %H:%M:%S %Y").to_string();
+                if let Some(local) = crate::strftime::local_from_unix(ts) {
+                    if let Some(s) = crate::strftime::format("%a %b %e %H:%M:%S %Y", &local) {
+                        return s;
+                    }
                 }
             }
             value.to_string()
@@ -1091,10 +1097,7 @@ fn apply_modifier(m: &Modifier, value: &str, app: &AppState, win_idx: usize) -> 
         Modifier::ExpandTime => {
             let expanded = expand_format_for_window(value, app, win_idx);
             if expanded.contains('%') {
-                use std::fmt::Write;
-                let formatted = chrono::Local::now().format(&expanded);
-                let mut buf = String::with_capacity(expanded.len() + 32);
-                if write!(buf, "{}", formatted).is_ok() { buf } else { expanded }
+                crate::strftime::format(&expanded, &crate::strftime::now()).unwrap_or(expanded)
             } else {
                 expanded
             }
@@ -1497,20 +1500,20 @@ fn expand_client_var(var: &str, app: &AppState) -> Option<String> {
         "client_prefix" => if app.client_prefix_active || matches!(app.mode, Mode::Prefix { .. }) { "1".into() } else { "0".into() },
         "client_activity" => match format_client(app) {
             Some(ci) => epoch_secs_ago(ci.last_activity.elapsed()).to_string(),
-            None => app.created_at.timestamp().to_string(),
+            None => app.created_at.timestamp().as_second().to_string(),
         },
         "client_created" => match format_client(app) {
             Some(ci) => epoch_secs_ago(ci.connected_at.elapsed()).to_string(),
-            None => app.created_at.timestamp().to_string(),
+            None => app.created_at.timestamp().as_second().to_string(),
         },
         "client_activity_string" | "client_created_string" => {
             let at = format_client(app).map(|ci| {
                 if var == "client_activity_string" { ci.last_activity.elapsed() } else { ci.connected_at.elapsed() }
             });
             match at {
-                Some(ago) => (chrono::Local::now() - chrono::Duration::from_std(ago).unwrap_or_default())
-                    .format("%a %b %e %H:%M:%S %Y").to_string(),
-                None => app.created_at.format("%a %b %e %H:%M:%S %Y").to_string(),
+                Some(ago) => crate::strftime::format("%a %b %e %H:%M:%S %Y", &crate::strftime::now_minus(ago))
+                    .unwrap_or_default(),
+                None => crate::strftime::format("%a %b %e %H:%M:%S %Y", &app.created_at).unwrap_or_default(),
             }
         }
         "client_key_table" => if app.client_prefix_active || matches!(app.mode, Mode::Prefix { .. }) {
@@ -1528,7 +1531,17 @@ fn expand_client_var(var: &str, app: &AppState) -> Option<String> {
             }
         },
         "client_termname" | "client_termtype" => env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
-        "client_termfeatures" => format_client(app).map(|ci| ci.termfeatures.to_string()).unwrap_or_default(),
+        // tmux lists the feature whatever `Spb` then does with it (measured
+        // from tmux 3.8 with `Spb@`), so only `terminal-features` decides here.
+        "client_termfeatures" => format_client(app).map(|ci| {
+            let progressbar = crate::terminal_features::progressbar_enabled(
+                app.terminal_features.iter().map(|(_, entry)| entry),
+                &ci.term,
+            );
+            ci.termfeatures
+                .with(crate::terminal_features::TerminalFeatures::PROGRESSBAR, progressbar)
+                .to_string()
+        }).unwrap_or_default(),
         "client_utf8" => "1".into(),
         "client_cell_width" => "8".into(),
         "client_cell_height" => "16".into(),
@@ -1695,10 +1708,10 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
         "session_attached" => app.attached_clients.to_string(),
         "session_windows" => app.windows.len().to_string(),
         "session_id" => format!("${}", app.session_id),
-        "session_created" => app.created_at.timestamp().to_string(),
-        "session_created_string" => app.created_at.format("%a %b %e %H:%M:%S %Y").to_string(),
-        "session_activity" | "session_last_attached" => app.created_at.timestamp().to_string(),
-        "session_activity_string" => app.created_at.format("%a %b %e %H:%M:%S %Y").to_string(),
+        "session_created" => app.created_at.timestamp().as_second().to_string(),
+        "session_created_string" => crate::strftime::format("%a %b %e %H:%M:%S %Y", &app.created_at).unwrap_or_default().to_string(),
+        "session_activity" | "session_last_attached" => app.created_at.timestamp().as_second().to_string(),
+        "session_activity_string" => crate::strftime::format("%a %b %e %H:%M:%S %Y", &app.created_at).unwrap_or_default().to_string(),
         "session_group" | "session_group_list" => app.session_group.clone().unwrap_or_default(),
         "session_alerts" | "session_stack" => String::new(),
         "session_group_attached" => {
@@ -1732,7 +1745,7 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
         "window_width" => win.area.width.to_string(),
         "window_height" => win.area.height.to_string(),
         "window_format" => "1".into(),
-        "window_activity" => app.created_at.timestamp().to_string(),
+        "window_activity" => app.created_at.timestamp().as_second().to_string(),
         "window_silence_flag" => if win.silence_flag { "1".into() } else { "0".into() },
         "window_bell_flag" => if win.bell_flag { "1".into() } else { "0".into() },
         "window_linked" => if win.linked_from.is_some() { "1".into() } else { "0".into() },
@@ -1887,11 +1900,14 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
                 // What the shell last said about itself over OSC 7 / OSC 9;9,
                 // if anything.  Read once: the PEB walk below must not hold the
                 // parser lock.
-                let announced = p
+                // Same lock: whether the warm claim's injected `cd <dir>; cls`
+                // is still in flight (see the cwd_hint block below).
+                let (announced, rehome_in_flight) = p
                     .term
                     .lock()
                     .ok()
-                    .and_then(|t| t.screen().path().map(str::to_owned));
+                    .map(|t| (t.screen().path().map(str::to_owned), t.screen().squelch_clear_armed()))
+                    .unwrap_or((None, true));
 
                 // Layer 0 (issue #615): a pane running `wsl` or `ssh` has no
                 // Win32 process that knows where the shell is.  wsl.exe keeps
@@ -1933,10 +1949,34 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
                 // answers with the server's working directory (#615 follow
                 // up).  Everything else keeps trusting the reading.
                 {
-                    let live = p
-                        .child_pid
-                        .and_then(crate::platform::process_info::get_foreground_cwd);
+                    // Same freshness split as `pane_current_command` above: a
+                    // frame may be one process table refresh behind, a command
+                    // reply may not (it read the folder the user had just left
+                    // for a `cmd.exe` split, whose shell runs under a wrapper).
+                    let live = p.child_pid.and_then(|pid| {
+                        if FORMAT_ASYNC.with(|c| c.get()) {
+                            crate::platform::process_info::get_foreground_cwd(pid)
+                        } else {
+                            crate::platform::process_info::get_foreground_cwd_fresh(pid)
+                        }
+                    });
                     if let Some(hint) = p.cwd_hint.as_ref() {
+                        // The injected line ends in `cls`/`clear`, and the
+                        // parser disarms its detector on that clear, so a
+                        // disarmed detector means the `cd` has RUN: from then on
+                        // the reading is the truth even when it names the
+                        // pool's own directory.  Latching only on "a reading
+                        // other than the pool's directory" left the hint alive
+                        // when no query happened to land while the shell sat in
+                        // the requested directory, so a later `cd` back into the
+                        // pool's directory kept answering with the request
+                        // forever (test_issue630 two splits: the shell's prompt
+                        // said `neutral`, the format said `X`).  Only for shells
+                        // whose `cd` moves the Win32 directory: Git Bash's does
+                        // not, and there the request stays the answer.
+                        if hint.reading_follows_cd && !rehome_in_flight {
+                            hint.settled.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                         if hint.pid == p.child_pid
                             && !hint.settled.load(std::sync::atomic::Ordering::Relaxed)
                         {
@@ -1995,6 +2035,19 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
                 } else { String::new() }
             } else { String::new() }
         }
+        // format.c:2612 and :2623 at tag 3.8. A pane that never set one reads
+        // as hidden and 0.
+        "pane_pb_state" => target_pane().map_or(String::new(), |p| {
+            match p.progress().0 {
+                0 => "hidden",
+                1 => "normal",
+                2 => "error",
+                3 => "indeterminate",
+                _ => "paused",
+            }
+            .to_string()
+        }),
+        "pane_pb_progress" => target_pane().map_or(String::new(), |p| p.progress().1.to_string()),
         "pane_pid" => {
             if let Some(p) = target_pane() {
                 p.child_pid.map(|pid| pid.to_string()).unwrap_or_default()
@@ -2057,7 +2110,7 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
             .unwrap_or_default(),
         "pane_dead_time" => target_pane()
             .and_then(|p| p.dead_info)
-            .map(|info| info.time.timestamp().to_string())
+            .map(|info| info.time.as_second().to_string())
             .unwrap_or_default(),
         "pane_dead_signal" => String::new(),
         "pane_format" => "1".into(),
@@ -2184,11 +2237,10 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
             .unwrap_or_default(),
         "pane_start_path" => String::new(),
         // tmux format_cb_pane_tabs lists the set tab stops of the pane's
-        // screen.  The pane emulator keeps the default stops only (every 8
-        // columns from column 8, as tmux screen_reset_tabs sets them), so
-        // they follow from the pane width (#827).
+        // screen (#827), which ESC H and CSI g change. From the live parser,
+        // as tmux reads `wp->base`.
         "pane_tabs" => target_pane()
-            .map(|p| pane_tab_stops(p.last_cols))
+            .and_then(|p| p.live_parser().lock().ok().map(|parser| pane_tab_stops(parser.screen())))
             .unwrap_or_default(),
         "pane_fg" => {
             if let Some(p) = target_pane() {
@@ -2252,6 +2304,18 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
                 }
             }
             "0".into()
+        }
+        // The program's OSC 12 colour as #rrggbb, then the cursor-colour
+        // option by its colour name, then `none` (format.c
+        // format_cb_cursor_colour at tag 3.8).
+        "cursor_colour" => {
+            match target_pane() {
+                Some(p) => {
+                    let program = p.live_parser().lock().ok().and_then(|parser| parser.screen().program_cursor_colour());
+                    crate::cursor_colour::format_value(program, &crate::cursor_colour::pane_value(app, win, p))
+                }
+                None => "none".into(),
+            }
         }
 
         // ── Mouse ──
@@ -2352,16 +2416,28 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
                     .unwrap_or_default()
             } else { String::new() }
         }
-        // tmux format.c reads these off the target pane's own screen
-        // (wp->base.rupper / rlower), not the active pane's.
-        "scroll_region_upper" | "scroll_region_lower" => {
-            let region = target_pane()
-                .and_then(|p| p.live_parser().lock().ok().map(|parser| parser.screen().scroll_region()));
-            match region {
-                Some((upper, _)) if var == "scroll_region_upper" => upper.to_string(),
-                Some((_, lower)) => lower.to_string(),
-                None => "0".into(),
-            }
+        // The pane's scroll region and origin mode, from the live parser
+        // (format.c:2834, :2843 at tag 3.8).
+        "scroll_region_upper" | "scroll_region_lower" | "origin_flag" => target_pane()
+            .and_then(|p| {
+                let parser = p.live_parser().lock().ok()?;
+                let screen = parser.screen();
+                let (upper, lower) = screen.scroll_region();
+                Some(match var {
+                    "scroll_region_upper" => upper.to_string(),
+                    "scroll_region_lower" => lower.to_string(),
+                    _ => if screen.origin_mode() { "1" } else { "0" }.to_string(),
+                })
+            })
+            .unwrap_or_else(|| "0".into()),
+
+        // ── list-commands (cmd-list-commands.c) ──
+        "command_list_name" | "command_list_alias" | "command_list_usage" => {
+            COMMAND_LIST_OVERRIDE.with(|c| c.borrow().as_ref().map(|(n, a, u)| match var {
+                "command_list_name" => n.clone(),
+                "command_list_alias" => a.clone(),
+                _ => u.clone(),
+            })).unwrap_or_default()
         }
 
         // ── Buffer ──
@@ -2390,7 +2466,7 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
             let idx = BUFFER_IDX_OVERRIDE.get().unwrap_or(0);
             app.paste_buffers.get(idx).map(|b| b.name.clone()).unwrap_or_default()
         }
-        "buffer_created" => app.created_at.timestamp().to_string(),
+        "buffer_created" => app.created_at.timestamp().as_second().to_string(),
 
         // ── Client ──
         // Every client_* variable is answered by expand_client_var (#724).
@@ -2412,7 +2488,7 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
             crate::session::read_namespace_instance(app.socket_name.as_deref()).unwrap_or_default()
         }
         "version" => VERSION.to_string(),
-        "start_time" => app.created_at.timestamp().to_string(),
+        "start_time" => app.created_at.timestamp().as_second().to_string(),
         "socket_path" => {
             // The server that answered (#730): `<dir>/default`, `<dir>/<-L label>`,
             // or the exact `-S` path its namespace was created for.
@@ -2534,12 +2610,11 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
         }
 
         // tmux format.c reads these off the target pane's screen mode too:
-        // MODE_ORIGIN, MODE_INSERT, MODE_WRAP, MODE_KCURSOR and MODE_KKEYPAD.
-        "origin_flag" | "insert_flag" | "wrap_flag" | "keypad_cursor_flag" | "keypad_flag" => {
+        // MODE_INSERT, MODE_WRAP, MODE_KCURSOR and MODE_KKEYPAD.
+        "insert_flag" | "wrap_flag" | "keypad_cursor_flag" | "keypad_flag" => {
             let on = target_pane().and_then(|p| p.live_parser().lock().ok()).map(|parser| {
                 let screen = parser.screen();
                 match var {
-                    "origin_flag" => screen.origin_mode(),
                     "insert_flag" => screen.insert_mode(),
                     "wrap_flag" => screen.autowrap(),
                     "keypad_cursor_flag" => screen.application_cursor(),
@@ -2555,7 +2630,7 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
         }
 
         // ── Misc ──
-        "line" | "command" | "command_list_name" | "command_list_alias" | "command_list_usage" | "config_files" => String::new(),
+        "line" | "command" | "config_files" => String::new(),
         "current_file" => crate::config::current_config_file(),
 
         // A user option resolves for THIS pane first (#728): tmux's
@@ -2806,6 +2881,14 @@ mod tests_issue985_bracket_paste_flag;
 mod tests_screen_mode_formats;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_issue1032_1034_vt_formats.rs"]
+mod tests_issue1032_1034_vt_formats;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_alt_screen_cursor_formats.rs"]
+mod tests_alt_screen_cursor_formats;
+
+#[cfg(test)]
 #[path = "../tests-rs/test_issue272_format_shell_cache.rs"]
 mod tests_issue272_format_shell_cache;
 
@@ -2848,3 +2931,23 @@ mod test_issue883_status_off_space;
 #[cfg(test)]
 #[path = "../tests-rs/test_control_client_size_formats.rs"]
 mod tests_control_client_size_formats;
+
+/// Formats a fixed date-time the way the status line formats the current
+/// local time, for the strftime parity table. None when the format is refused.
+#[cfg(test)]
+pub(crate) fn strftime_fixed_for_test(
+    fmt: &str,
+    t: (i32, u32, u32, u32, u32, u32, u32, i32),
+) -> Option<String> {
+    let (y, mo, d, h, mi, s, ns, off) = t;
+    let tz = jiff::tz::TimeZone::fixed(jiff::tz::Offset::from_seconds(off).ok()?);
+    let dt = jiff::civil::DateTime::new(
+        y as i16, mo as i8, d as i8, h as i8, mi as i8, s as i8, ns as i32,
+    )
+    .ok()?;
+    crate::strftime::format(fmt, &dt.to_zoned_datetime(tz).ok()?)
+}
+
+#[cfg(test)]
+#[path = "../tests-rs/test_strftime_parity.rs"]
+mod tests_strftime_parity;

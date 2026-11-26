@@ -35,15 +35,41 @@ pub(crate) fn csi_query(
         // a version request.
         ('q', [b'>'], 0) => Some(TerminalQuery::Xtversion),
         ('n', [b'?'], 996) => Some(TerminalQuery::ColourScheme),
+        // XTSMGRAPHICS, which tmux answers whatever it holds, unless it has
+        // more than three parameters (input_csi_dispatch_sm_graphics,
+        // input.c:2103 in tmux 3.8).
+        // `Params::len` counts subparameters too, which tmux does not.
+        ('S', [b'?'], _) if params.iter().count() <= 3 => Some(graphics_attribute(params)),
         _ => None,
     }
+}
+
+/// An XTSMGRAPHICS's parameters as tmux's `input_get(ictx, n, 0, 0)` reads
+/// them: a missing one is 0 and one holding a colon is -1.
+fn graphics_attribute(params: &vte::Params) -> TerminalQuery {
+    let mut read = params.iter().map(|p| match p {
+        [n] => i32::from(*n),
+        _ => -1,
+    });
+    let mut next = || read.next().unwrap_or(0);
+    TerminalQuery::GraphicsAttribute { item: next(), action: next(), value: next() }
 }
 
 pub(crate) fn osc_query(params: &[&[u8]], program_status: bool, bel: bool) -> Option<TerminalQuery> {
     match params {
         [b"7501", b"?"] if program_status => Some(TerminalQuery::ProgramStatus),
-        [b"10", b"?"] => Some(TerminalQuery::ForegroundColour { bel }),
-        [b"11", b"?"] => Some(TerminalQuery::BackgroundColour { bel }),
+        // The colours are filled in by the live parser; the detector only
+        // needs to know a reply may be due.
+        [b"10", b"?"] => Some(TerminalQuery::ForegroundColour { colour: None, bel }),
+        [b"11", b"?"] => Some(TerminalQuery::BackgroundColour { colour: None, bel }),
+        [b"12", b"?"] => Some(TerminalQuery::CursorColour { colour: None, bel }),
+        // tmux keeps the selection characters it knows, each once, and
+        // answers with the first (`input_osc_52_parse`, input.c:3371 at tag
+        // 3.8), so `xc` is `c` and `x` or nothing is none.
+        [b"52", selection, b"?"] => Some(TerminalQuery::Clipboard {
+            selection: selection.iter().copied().find(|c| b"cpqs01234567".contains(c)).unwrap_or(0),
+            bel,
+        }),
         // OSC 4 can hold several queries among its sets, so the live parser
         // takes them pair by pair (`palette_pairs`), not here.
         _ => None,
@@ -60,18 +86,10 @@ pub(crate) fn palette_pairs<'a>(
         .map_while(|pair| crate::palette::parse_palette_index(pair[0]).map(|i| (i, pair[1])))
 }
 
-/// Whether an `OSC 4` pair asks for a colour psmux answers: a `?` for one
-/// of the sixteen ANSI colours, whose outer terminal values the client
-/// reports, or for any index the pane has its own entry for (`own`), which
-/// tmux's `input_osc_4` answers from `colour_palette_get` (input.c:2947 at
-/// tag 3.8).
-pub(crate) fn is_palette_query(index: u8, spec: &[u8], own: Option<(u8, u8, u8)>) -> bool {
-    spec == b"?" && (index < 16 || own.is_some())
-}
-
-/// Whether an OSC may ask for a palette colour psmux answers. The detector
-/// has no palette, so any `?` counts: a query it flags that the live parser
-/// then leaves unanswered only releases held synchronized output early.
+/// Whether an OSC asks for a palette colour: a `?` for any index, as tmux's
+/// `input_osc_4` takes one (input.c:2945-2958 at tag 3.8). The host answers
+/// it from the pane's entry, the outer terminal's sixteen colours, or the
+/// xterm 256 colour table, so every one is a query here.
 fn asks_palette(params: &[&[u8]]) -> bool {
     match params {
         [b"4", rest @ ..] => palette_pairs(rest).any(|(_, spec)| spec == b"?"),

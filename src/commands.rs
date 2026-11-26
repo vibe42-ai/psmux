@@ -37,10 +37,18 @@ pub(crate) const DISPLAY_MESSAGE_DEFAULT_FMT: &str =
 pub fn resolve_run_shell() -> (String, Vec<String>) {
     #[cfg(windows)]
     {
-        if let Ok(path) = which::which("pwsh") {
+        // A Store packaged pwsh cannot start under an SSH command or in
+        // session 0 (ACCESS_DENIED from MSIX activation): every run-shell and
+        // if-shell condition then failed with "Access is denied" while the
+        // panes, which skip it (pane::cached_shell), worked. Skip it the same
+        // way here; classic powershell.exe is never Store packaged.
+        let usable = |p: &std::path::Path| {
+            !crate::pane::is_store_shell_path(&p.to_string_lossy()) || !crate::pane::store_shell_unusable()
+        };
+        if let Some(path) = which::which("pwsh").ok().filter(|p| usable(p)) {
             return (path.to_string_lossy().into_owned(), vec!["-NoProfile".to_string(), "-Command".to_string()]);
         }
-        if let Ok(path) = which::which("powershell") {
+        if let Some(path) = which::which("powershell").ok().filter(|p| usable(p)) {
             return (path.to_string_lossy().into_owned(), vec!["-NoProfile".to_string(), "-Command".to_string()]);
         }
         if let Ok(system_root) = std::env::var("SystemRoot").or_else(|_| std::env::var("SYSTEMROOT")) {
@@ -775,7 +783,7 @@ pub fn server_info_text(app: &AppState) -> String {
         std::process::id(),
         app.session_name,
         app.windows.len(),
-        (chrono::Local::now() - app.created_at).num_seconds(),
+        crate::strftime::now().duration_since(&app.created_at).as_secs(),
         crate::paths::port_file(app.port_file_base())
     )
 }
@@ -843,22 +851,9 @@ fn generate_list_clients(app: &AppState) -> String {
     crate::format::format_list_clients(app, crate::format::default_list_clients_format(), None)
 }
 
-/// Generate show-hooks output from AppState.
-fn generate_show_hooks(app: &AppState) -> String {
-    let mut output = String::new();
-    for (name, commands) in &app.hooks {
-        if commands.len() == 1 {
-            output.push_str(&format!("{} -> {}\n", name, commands[0]));
-        } else {
-            for (i, cmd) in commands.iter().enumerate() {
-                output.push_str(&format!("{}[{}] -> {}\n", name, i, cmd));
-            }
-        }
-    }
-    if output.is_empty() {
-        output.push_str("(no hooks)\n");
-    }
-    output
+/// Generate show-hooks output from AppState (see crate::show_hooks).
+fn generate_show_hooks(app: &AppState, args: &[&str]) -> String {
+    crate::show_hooks::format_show_hooks(&app.hooks, &crate::show_hooks::ShowHooksArgs::parse(args))
 }
 
 /// Generate show-options output locally (embedded mode fallback).
@@ -1102,6 +1097,17 @@ pub(crate) fn move_pane_in_window(app: &mut AppState, pos: usize, src_pane: Opti
 pub(crate) fn join_pane_local(app: &mut AppState, src_win: Option<usize>, src_pane: Option<usize>,
                    target_win: Option<usize>, target_pane: Option<usize>, horizontal: bool,
                    detach: bool, before: bool, size: Option<(u16, bool)>) -> bool {
+    // Moving a window's last pane removes the window, and the focus lands on
+    // a pane that may have its own mode parked.
+    crate::copy_mode::remove_keeping_modes(app, |app| {
+        join_pane_local_inner(app, src_win, src_pane, target_win, target_pane, horizontal, detach, before, size)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn join_pane_local_inner(app: &mut AppState, src_win: Option<usize>, src_pane: Option<usize>,
+                   target_win: Option<usize>, target_pane: Option<usize>, horizontal: bool,
+                   detach: bool, before: bool, size: Option<(u16, bool)>) -> bool {
     // Resolve source/target display indices to Vec positions (default: active
     // window). win_pos honors gapped indices left by renumber-windows off.
     let src_pos = match src_win { Some(d) => app.win_pos(d), None => Some(app.active_idx) };
@@ -1213,9 +1219,11 @@ pub(crate) fn join_pane_local(app: &mut AppState, src_win: Option<usize>, src_pa
     true
 }
 
-/// Generate list-commands output.
-fn generate_list_commands() -> String {
-    crate::help::cli_command_lines().join("\n")
+/// list-commands as tmux prints it (crate::list_commands); an unknown
+/// command is shown as its error.
+fn generate_list_commands(app: &AppState, args: &[&str]) -> String {
+    let args = crate::list_commands::ListCommandsArgs::parse(args);
+    crate::list_commands::render_with_app(app, &args).unwrap_or_else(|e| e)
 }
 
 /// Build the choose-tree data for the WindowChooser mode.
@@ -2030,9 +2038,25 @@ pub(crate) fn in_server_target_kind(cmd: &str) -> Option<InServerTarget> {
         "kill-pane" | "killp" | "respawn-pane" | "respawnp" | "resize-pane" | "resizep"
         | "capture-pane" | "capturep" | "clear-history" | "clearhist" | "pipe-pane" | "pipep"
         | "send-keys" | "send" | "display-message" | "display" | "select-layout" | "selectl"
-        | "paste-buffer" | "pasteb" | "split-window" | "splitw" => Some(InServerTarget::Pane),
+        | "paste-buffer" | "pasteb" | "split-window" | "splitw"
+        // cmd-select-pane.c: CMD_FIND_PANE. A bare `select-pane -t 1` or
+        // `-t !` died in the CLI as a session name (issue #1040).
+        | "select-pane" | "selectp" => Some(InServerTarget::Pane),
         _ => None,
     }
+}
+
+/// Must a `kind` `-t` be resolved on live state (and rewritten to its id)
+/// before the command runs? A bare token always (a window or pane of this
+/// session before a session name), and for a pane target also a
+/// `window.pane` whose pane half is a special token (`.-`, `:.+`, `1.!`):
+/// the generic parser reads no pane at all there and the command fell back
+/// to the active pane (issue #1040).
+pub(crate) fn target_resolved_in_server(kind: InServerTarget, t: &str) -> bool {
+    crate::cli::bare_target_token(t)
+        || (kind == InServerTarget::Pane
+            && (crate::cli::split_special_pane_target(t).is_some()
+                || crate::cli::has_special_window_part(t)))
 }
 
 /// Resolve a window or pane `-t` on the in server route to the `@id` or
@@ -2062,7 +2086,7 @@ pub(crate) fn resolve_in_server_target(app: &AppState, kind: InServerTarget, t: 
             Ok(Some(format!("@{}", app.windows[pos].id)))
         }
         InServerTarget::Pane => {
-            if plain.starts_with('{') {
+            if plain.starts_with('{') && !crate::cli::special_pane_token(plain) {
                 return Ok(None);
             }
             // This session's own name, when no window has it, is the session
@@ -2129,6 +2153,102 @@ fn deliver_paste_buffer(app: &mut AppState, text: &str, pb: &PasteBufferArgs) ->
     } else {
         crate::input::send_text_to_active(app, &payload)
     }
+}
+
+/// How a paste of the OS clipboard is written once the text is known: raw, as
+/// prefix + ] (copy_mode::paste_latest) writes it, or as the `paste-buffer`
+/// that asked for it.
+#[derive(Debug, Clone)]
+pub(crate) enum ClipboardPasteDelivery {
+    Raw,
+    Buffer(PasteBufferArgs),
+}
+
+/// A paste of the OS clipboard (the paste stack was empty, #428) waiting for a
+/// clipboard another window holds open.
+///
+/// A clipboard history listener, a VNC server or a graphics driver panel opens
+/// the clipboard for 10 to 25 ms after every change; the plain read retries for
+/// about 10 ms, so prefix + ] and `paste-buffer` pasted nothing at all
+/// (test_issue428_proof F2 in the 2026-11-12 sweep; a 100 ms holder made 5 of 5
+/// pastes vanish).  Waiting on the server loop would freeze every pane, so a
+/// thread waits for the clipboard and the loop holds every later request
+/// (server::holds_behind_paste) until the text is written or the wait gives
+/// up: keys typed after the paste never overtake it and are never lost.
+pub(crate) struct PendingClipboardPaste {
+    rx: std::sync::mpsc::Receiver<Option<String>>,
+    deadline: std::time::Instant,
+    pane_id: Option<usize>,
+    delivery: ClipboardPasteDelivery,
+}
+
+impl std::fmt::Debug for PendingClipboardPaste {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingClipboardPaste")
+            .field("pane_id", &self.pane_id)
+            .field("delivery", &self.delivery)
+            .finish()
+    }
+}
+
+/// The OS clipboard text for a paste whose stack is empty.  `Some` when it
+/// could be read now; `None` when another window holds the clipboard open, in
+/// which case a pending paste was started and the caller writes nothing.
+pub(crate) fn clipboard_text_or_wait(app: &mut AppState, delivery: ClipboardPasteDelivery) -> Option<String> {
+    match crate::clipboard::try_read_from_system_clipboard() {
+        Ok(text) => Some(text.unwrap_or_default()),
+        Err(crate::clipboard::ClipboardBusy) => {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::clipboard::read_from_system_clipboard_waiting(
+                    crate::clipboard::PASTE_GESTURE_TIMEOUT,
+                ));
+            });
+            let deadline = std::time::Instant::now()
+                + crate::clipboard::PASTE_GESTURE_TIMEOUT
+                + std::time::Duration::from_millis(250);
+            start_pending_clipboard_paste(app, rx, deadline, delivery);
+            None
+        }
+    }
+}
+
+/// Park a paste on `app` until `rx` answers or `deadline` passes; the pane it
+/// was asked for is the active one now.
+pub(crate) fn start_pending_clipboard_paste(
+    app: &mut AppState,
+    rx: std::sync::mpsc::Receiver<Option<String>>,
+    deadline: std::time::Instant,
+    delivery: ClipboardPasteDelivery,
+) {
+    let pane_id = crate::copy_mode::active_pane_id(app);
+    app.clipboard_paste_pending = Some(PendingClipboardPaste { rx, deadline, pane_id, delivery });
+}
+
+/// Finish the pending clipboard paste if its read has answered or is overdue,
+/// writing the text to the pane it was asked for.  `true` when nothing is
+/// pending any more (the held requests may run), `false` while it still waits.
+pub(crate) fn poll_pending_clipboard_paste(app: &mut AppState) -> bool {
+    let Some(p) = app.clipboard_paste_pending.as_ref() else { return true };
+    let text = match p.rx.try_recv() {
+        Ok(text) => text,
+        Err(std::sync::mpsc::TryRecvError::Empty) if std::time::Instant::now() < p.deadline => return false,
+        Err(_) => None,
+    };
+    let Some(p) = app.clipboard_paste_pending.take() else { return true };
+    if let (Some(text), Some(id)) = (text.filter(|t| !t.is_empty()), p.pane_id) {
+        let _ = with_paste_target(app, &format!("%{}", id), |app| match &p.delivery {
+            ClipboardPasteDelivery::Raw => {
+                let win = &mut app.windows[app.active_idx];
+                if let Some(pane) = crate::tree::active_pane_mut(&mut win.root, &win.active_path) {
+                    let _ = write!(pane.writer, "{}", text);
+                }
+                Ok(())
+            }
+            ClipboardPasteDelivery::Buffer(pb) => deliver_paste_buffer(app, &text, pb),
+        });
+    }
+    true
 }
 
 /// Parse a `paste-buffer` command line.
@@ -2312,8 +2432,14 @@ fn run_paste_buffer_here(app: &mut AppState, pb: &PasteBufferArgs) -> io::Result
             let top = app.paste_top().unwrap_or_default().to_string();
             if top.is_empty() {
                 // Issue #428: an empty stack falls back to the OS clipboard, the
-                // same fallback server/connection.rs applies.
-                crate::clipboard::read_from_system_clipboard().unwrap_or_default()
+                // same fallback server/connection.rs applies.  A clipboard
+                // another window holds open is waited for off the server
+                // loop, and the paste lands when it is free.
+                let delivery = ClipboardPasteDelivery::Buffer(PasteBufferArgs { target: None, ..pb.clone() });
+                match clipboard_text_or_wait(app, delivery) {
+                    Some(text) => text,
+                    None => return Ok(None),
+                }
             } else {
                 top
             }
@@ -2794,7 +2920,22 @@ pub(crate) const KILL_PANE_F_WITHOUT_A: &str = "-f only valid with -a";
 /// cmd-find.c:1093-1110). Ids (`$`, `@`, `%`) and `window.pane` forms stay
 /// with the arms below. Returns true when the line was handled here.
 pub(crate) fn forward_to_other_session(app: &mut AppState, parts: &[&str], cmd: &str) -> bool {
-    match route_to_other_session(app, parts, cmd) {
+    // This route runs hooks, menus and bindings, whose lines tmux parses, and
+    // the `set` arm below reads a user-keys value with tmux's escapes. The
+    // session the line goes to reads it with psmux's lexer, so the value is
+    // read here first, as it would have been had the line stayed (#1014).
+    if let Some(read) = crate::config::user_keys_line_tmux_read(cmd) {
+        let words = parse_command_line(&read);
+        let parts: Vec<&str> = words.iter().map(String::as_str).collect();
+        let route = route_to_other_session(app, &parts, &read);
+        return forward_routed(app, route);
+    }
+    let route = route_to_other_session(app, parts, cmd);
+    forward_routed(app, route)
+}
+
+fn forward_routed(app: &mut AppState, route: OtherSessionRoute) -> bool {
+    match route {
         OtherSessionRoute::Local => false,
         OtherSessionRoute::Forwarded => true,
         OtherSessionRoute::Refused(msg) => {
@@ -2955,19 +3096,21 @@ pub(crate) fn kill_windows_except(app: &mut AppState, keep: usize) -> usize {
     if keep >= app.windows.len() {
         return 0;
     }
-    let mut killed = 0;
-    for pos in (0..app.windows.len()).rev() {
-        if pos == keep {
-            continue;
+    crate::copy_mode::remove_keeping_modes(app, |app| {
+        let mut killed = 0;
+        for pos in (0..app.windows.len()).rev() {
+            if pos == keep {
+                continue;
+            }
+            let mut win = app.windows.remove(pos);
+            kill_all_children(&mut win.root);
+            app.on_window_removed(pos);
+            killed += 1;
         }
-        let mut win = app.windows.remove(pos);
-        kill_all_children(&mut win.root);
-        app.on_window_removed(pos);
-        killed += 1;
-    }
-    // Only the kept window is left, and it is the current one.
-    app.active_idx = 0;
-    killed
+        // Only the kept window is left, and it is the current one.
+        app.active_idx = 0;
+        killed
+    })
 }
 
 /// `kill-pane -a [-t target]` on the in server route (#964). No target is the
@@ -3133,6 +3276,7 @@ fn execute_unaliased_command(app: &mut AppState, cmd: &str) -> io::Result<()> {
         return Ok(());
     }
 
+    if crate::server::shared::run_in_other_session(app, &parts, cmd) { return Ok(()); }
     // A `-t` naming another session runs on that session's server (#938).
     if forward_to_other_session(app, &parts, cmd) {
         return Ok(());
@@ -3173,7 +3317,7 @@ fn execute_unaliased_command(app: &mut AppState, cmd: &str) -> io::Result<()> {
         if let Some(t_pos) = parts.iter().position(|p| *p == "-t") {
             if let Some(t) = parts.get(t_pos + 1) {
                 has_target = true;
-                let resolved = if crate::cli::bare_target_token(t) {
+                let resolved = if target_resolved_in_server(kind, t) {
                     resolve_in_server_target(app, kind, t)
                 } else {
                     Ok(None)
@@ -3258,15 +3402,17 @@ fn execute_unaliased_command(app: &mut AppState, cmd: &str) -> io::Result<()> {
             }
             if let Some(pos) = removed_pos {
                 if app.windows.len() > 1 && pos < app.windows.len() {
-                    let mut win = app.windows.remove(pos);
-                    kill_all_children(&mut win.root);
-                    app.on_window_removed(pos);
-                    if app.active_idx > pos {
-                        app.active_idx -= 1;
-                    }
-                    if app.active_idx >= app.windows.len() {
-                        app.active_idx = app.windows.len() - 1;
-                    }
+                    crate::copy_mode::remove_keeping_modes(app, |app| {
+                        let mut win = app.windows.remove(pos);
+                        kill_all_children(&mut win.root);
+                        app.on_window_removed(pos);
+                        if app.active_idx > pos {
+                            app.active_idx -= 1;
+                        }
+                        if app.active_idx >= app.windows.len() {
+                            app.active_idx = app.windows.len() - 1;
+                        }
+                    });
                 }
             }
         }
@@ -3512,11 +3658,11 @@ fn execute_unaliased_command(app: &mut AppState, cmd: &str) -> io::Result<()> {
             show_output_popup(app, "list-clients", output);
         }
         "list-commands" | "lscm" => {
-            let output = generate_list_commands();
+            let output = generate_list_commands(app, &parts[1..]);
             show_output_popup(app, "list-commands", output);
         }
         "show-hooks" => {
-            let output = generate_show_hooks(app);
+            let output = generate_show_hooks(app, &parts[1..]);
             show_output_popup(app, "show-hooks", output);
         }
         "zoom-pane" | "zoom" | "resizep -Z" => {
@@ -4069,6 +4215,8 @@ fn execute_unaliased_command(app: &mut AppState, cmd: &str) -> io::Result<()> {
                         fresh.screen_mut().set_extended_keys_mode(parser.screen().extended_keys_mode());
                         // The pane's options are unchanged too (#980).
                         fresh.screen_mut().set_pane_colours(parser.screen().pane_colours().cloned());
+                        fresh.screen_mut().set_scroll_on_clear(parser.screen().scroll_on_clear());
+                        fresh.screen_mut().keep_colours(parser.screen());
                         *parser = fresh;
                     }
                 }
@@ -4476,14 +4624,31 @@ fn execute_unaliased_command(app: &mut AppState, cmd: &str) -> io::Result<()> {
                         if occupied.is_some() && !has("-k") {
                             app.status_message = Some((format!("link-window: index in use: {}", didx.unwrap_or(0)), Instant::now(), None));
                         } else {
+                            // tmux selects the new link when -k removes the
+                            // current window, -d or not (server_link_window,
+                            // server-fn.c: "Force select/redraw if current").
+                            let detach = has("-d") && occupied != Some(app.active_idx);
                             if let Some(pos) = occupied {
-                                let mut win = app.windows.remove(pos);
-                                kill_all_children(&mut win.root);
-                                app.on_window_removed(pos);
-                                if app.active_idx >= app.windows.len() && !app.windows.is_empty() {
-                                    app.active_idx = app.windows.len() - 1;
-                                }
+                                crate::copy_mode::remove_keeping_modes(app, |app| {
+                                    let mut win = app.windows.remove(pos);
+                                    kill_all_children(&mut win.root);
+                                    app.on_window_removed(pos);
+                                    // The current window slides down with the
+                                    // ones after the occupant, so -d keeps it.
+                                    if pos < app.active_idx {
+                                        app.active_idx -= 1;
+                                    }
+                                    if app.active_idx >= app.windows.len() && !app.windows.is_empty() {
+                                        app.active_idx = app.windows.len() - 1;
+                                    }
+                                });
                             }
+                            // The source slid down too when it came after the
+                            // occupant, or the window after it was linked.
+                            let src_pos = match occupied {
+                                Some(p) if p < src_pos => src_pos - 1,
+                                _ => src_pos,
+                            };
                             let src_pos = src_pos.min(app.windows.len().saturating_sub(1));
                             let src_id = app.windows[src_pos].id;
                             let src_name = app.windows[src_pos].name.clone();
@@ -4502,11 +4667,13 @@ fn execute_unaliased_command(app: &mut AppState, cmd: &str) -> io::Result<()> {
                                         app.windows.insert(d, win);
                                     }
                                 }
-                                if has("-d") {
+                                if detach {
+                                    // Back to the window that had the focus, with
+                                    // its own mode: create_window parked it.
                                     if let Some(p) = prev_active_id
                                         .and_then(|id| app.windows.iter().position(|w| w.id == id))
                                     {
-                                        app.active_idx = p;
+                                        switch_with_copy_save(app, |app| { app.active_idx = p; });
                                     }
                                 } else if let Some(p) = app.windows.iter().position(|w| w.id == new_id) {
                                     if p != app.active_idx { app.last_window_idx = app.active_idx; }
@@ -4537,15 +4704,17 @@ fn execute_unaliased_command(app: &mut AppState, cmd: &str) -> io::Result<()> {
                         app.status_message = Some((format!("unlink-window: {}", msg), Instant::now(), None));
                     }
                     Ok(removed_pos) if app.windows.len() > 1 => {
-                        let mut win = app.windows.remove(removed_pos);
-                        kill_all_children(&mut win.root);
-                        app.on_window_removed(removed_pos);
-                        if removed_pos < app.active_idx {
-                            app.active_idx -= 1;
-                        }
-                        if app.active_idx >= app.windows.len() {
-                            app.active_idx = app.windows.len() - 1;
-                        }
+                        crate::copy_mode::remove_keeping_modes(app, |app| {
+                            let mut win = app.windows.remove(removed_pos);
+                            kill_all_children(&mut win.root);
+                            app.on_window_removed(removed_pos);
+                            if removed_pos < app.active_idx {
+                                app.active_idx -= 1;
+                            }
+                            if app.active_idx >= app.windows.len() {
+                                app.active_idx = app.windows.len() - 1;
+                            }
+                        });
                         fire_hooks(app, "window-unlinked");
                     }
                     Ok(_) => {}
@@ -5306,3 +5475,15 @@ mod tests_issue1005_attached_target;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue964_kill_pane_all.rs"]
 mod tests_issue964_kill_pane_all;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue1040_special_pane_targets.rs"]
+mod tests_issue1040_special_pane_targets;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_run_shell_store_fallback.rs"]
+mod tests_run_shell_store_fallback;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_clipboard_paste_hold.rs"]
+mod tests_clipboard_paste_hold;

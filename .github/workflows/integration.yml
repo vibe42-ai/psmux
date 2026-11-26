@@ -39,8 +39,9 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable, reviewed 2026-11-16
         with:
+          toolchain: stable
           targets: x86_64-pc-windows-msvc
 
       - name: Build x64 release binary

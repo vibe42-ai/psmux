@@ -199,6 +199,12 @@ fn window_option_listing_preserves_its_supported_surface() {
         "remain-on-exit",
         // A window option in tmux (options-table.c:1694, #923).
         "remain-on-exit-format",
+        // A window option in tmux (options-table.c:1723).
+        "scroll-on-clear",
+        // A window option in tmux (options-table.c:354).
+        "cursor-colour",
+        // A window option in tmux (options-table.c:1330).
+        "clock-mode-style",
         "window-status-format",
         "window-status-current-format",
         "window-status-separator",

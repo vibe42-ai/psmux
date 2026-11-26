@@ -17,6 +17,8 @@ mod render_state;
 mod rendering;
 mod config;
 mod commands;
+mod show_hooks;
+mod list_commands;
 mod run_shell;
 mod pane;
 mod pipe_pane;
@@ -37,6 +39,7 @@ mod layout;
 mod window_ops;
 mod util;
 mod format;
+mod strftime;
 mod help;
 mod server;
 mod preview;
@@ -49,6 +52,7 @@ mod debug_log;
 mod control;
 mod scrollback;
 mod control_ring;
+mod tmux_passthrough_unwrap;
 mod resize_window;
 mod proxy_pane;
 mod cross_session;
@@ -68,6 +72,11 @@ mod socket_path;
 mod environ;
 mod program_status;
 mod pane_colours;
+mod scroll_on_clear;
+mod cursor_colour;
+mod style_colours;
+mod clipboard_read;
+mod clock_style;
 
 use std::io::{self, Write, Read as _, BufRead as _, IsTerminal};
 use std::time::Duration;
@@ -81,7 +90,7 @@ use crossterm::{execute};
 use crossterm::event::{EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste};
 
 use crate::platform::enable_virtual_terminal_processing;
-use crate::cli::{print_help, print_version, print_commands};
+use crate::cli::{print_help, print_version};
 use crate::session::{cleanup_stale_port_files, reap_orphaned_servers, read_session_key, send_control,
     send_control_with_response, resolve_default_session_name};
 use crate::rendering::apply_cursor_style;
@@ -793,6 +802,40 @@ fn session_holding_client(ns: Option<&str>, spec: &str) -> Option<String> {
         .into_iter()
         .find(|(_, text)| text.lines().any(|tty| crate::cli::client_spec_matches(tty.trim(), spec)))
         .map(|(name, _)| name)
+}
+
+/// The session whose server has the client a `switch-client` acts on, or
+/// `None` to keep the routing already chosen. tmux finds that client before
+/// anything else (cmd-queue.c, CMD_CLIENT_CFLAG at tag 3.8): `-c` names it,
+/// inside a pane it is the pane's own client, and otherwise it is the most
+/// recently active client (cmd_find_best_client). psmux has a server per
+/// session, so that client may be on any of them. With no client anywhere the
+/// routing stays as it was. A `-c` that names no client is tmux's
+/// `can't find client`. Shared server mode has one server for every session,
+/// so routing there is left alone.
+fn switch_client_route(ns: Option<&str>, client: Option<&str>) -> Option<String> {
+    if crate::server::shared::resolve_for_this_process() == Ok(crate::server::shared::ServerMode::Shared) {
+        return None;
+    }
+    if let Some(c) = client {
+        let wanted = client_target_tty(c).unwrap_or_else(|| c.to_string());
+        return match session_holding_client(ns, &wanted) {
+            Some(sess) => Some(sess),
+            None => {
+                eprintln!("psmux: can't find client: {}", c);
+                std::process::exit(1);
+            }
+        };
+    }
+    let tmux_env = env::var("TMUX").ok();
+    let psmux_dir = std::path::PathBuf::from(crate::paths::psmux_dir());
+    if crate::session::pane_session_in_namespace(ns, tmux_env.as_deref(), &psmux_dir).is_some() {
+        return None;
+    }
+    let line = format!("list-clients -F {}\n", crate::util::quote_arg("#{client_activity}"));
+    let listings = query_every_session(ns, &line);
+    let routed = env::var("PSMUX_TARGET_SESSION").ok();
+    crate::cli::best_client_session(&listings, routed.as_deref())
 }
 
 /// A CLI command list (see [`crate::cli::split_cli_command_list`]): `args`
@@ -1640,8 +1683,11 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
             // a session of that name exists, it routes like no `-t` at all
             // and the server resolves it; it used to die here with "no server
             // running on session '<ns>__w2'".
+            // `0.{previous}` and `w.!` are a window and a special pane of
+            // this session too (cmd-find.c:1089), never a session (#1040).
             let bare_window_or_pane = window_or_pane_command
-                && crate::cli::bare_target_token(&target)
+                && (crate::cli::bare_target_token(&target)
+                    || (!target.contains(':') && crate::cli::split_special_pane_target(&target).is_some()))
                 && !std::path::Path::new(&crate::paths::port_file(&port_file_base)).exists();
             // set-buffer's -t is only used for -w in tmux, and a client that
             // does not exist is not an error. psmux keeps buffers per session,
@@ -1789,8 +1835,17 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
             print_version();
             return Ok(());
         }
-        "list-commands" | "lscm" => {
-            print_commands();
+        // Without -F the rows need no server; -F takes the server route below,
+        // where the format engine is.
+        "list-commands" | "lscm" if crate::list_commands::ListCommandsArgs::parse(&cmd_args[1..]).format.is_none() => {
+            let args = crate::list_commands::ListCommandsArgs::parse(&cmd_args[1..]);
+            match crate::list_commands::render(&args, &mut |_, e| crate::list_commands::default_row(e)) {
+                Ok(text) => print!("{}", text),
+                Err(e) => {
+                    eprintln!("psmux: {}", e);
+                    std::process::exit(1);
+                }
+            }
             return Ok(());
         }
         // Hidden internal command for empirical preview rendering tests.
@@ -2302,7 +2357,7 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
                 // Parse -L socket name for namespace isolation
                 let server_socket_name = args.iter().position(|a| a == "-L").and_then(|i| args.get(i+1)).map(|s| s.clone());
                 // Check for initial command via -c flag (shell-wrapped)
-                let initial_cmd = args.iter().position(|a| a == "-c").and_then(|i| args.get(i+1)).map(|s| s.clone());
+                let initial_cmd = args.iter().position(|a| a.as_str() == "-c").and_then(|i| args.get(i+1)).map(|s| s.clone());
                 // Parse start directory via -d flag
                 let srv_start_dir = args.iter().position(|a| a == "-d").and_then(|i| args.get(i+1)).map(|s| s.clone());
                 // Parse window name via -n flag
@@ -3001,7 +3056,15 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
                         // used to come back as single spaces (#734 follow up).
                         match send_control_with_response(format!("display-message -p {}\n", crate::util::quote_arg(&fmt))) {
                             Ok(resp) => { let trimmed = resp.trim(); if !trimmed.is_empty() { println!("{}", trimmed); } }
-                            Err(_) => {}
+                            // The caller asked where the session landed and
+                            // relies on the line (a launcher reads the window
+                            // it made from it). Losing it silently at exit 0
+                            // told the caller nothing was made.
+                            Err(e) => {
+                                eprintln!("psmux: new-session: session '{}' was created, but its -P reply was lost: {}",
+                                    name, e);
+                                std::process::exit(1);
+                            }
                         }
                     }
                     let list_status = run_new_session_list(command_list.as_ref(), &port_file_base, l_socket_name.as_deref());
@@ -4382,7 +4445,7 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
                     set.target = target_position.and_then(|position| args.get(position + 1)).cloned();
                 }
                 if set.clipboard && set.new_name.is_none() {
-                    crate::clipboard::copy_to_system_clipboard(&set.content);
+                    crate::clipboard::copy_to_system_clipboard_for_command(&set.content);
                 }
                 // A rename can fail ("unknown buffer: X", "no buffer"), and
                 // tmux reports it with exit 1.
@@ -5655,6 +5718,20 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
                     i += 1;
                 }
                 cmd.push('\n');
+                // The command goes to the server the CLIENT is on, as tmux
+                // finds the client before anything else (cmd_find_client).
+                // Routing so far picked a session, and from outside a pane
+                // that is the most recent one, which need not have any client:
+                // a session made after the client attached took the command
+                // and it did nothing (follow up to #1028).
+                let client_arg = cmd_args
+                    .iter()
+                    .position(|a| a.as_str() == "-c")
+                    .and_then(|i| cmd_args.get(i + 1))
+                    .map(|s| s.to_string());
+                if let Some(sess) = switch_client_route(l_socket_name.as_deref(), client_arg.as_deref()) {
+                    env::set_var("PSMUX_TARGET_SESSION", &sess);
+                }
                 // #483: the server validates a -t target and replies "ERROR
                 // <reason>" for an unresolvable window/pane/session so scripts
                 // see a non-zero exit instead of a silent success. A missing/
@@ -5770,7 +5847,7 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
                         std::fs::read_to_string(&path)?
                     };
                     if propagate_to_clipboard {
-                        crate::clipboard::copy_to_system_clipboard(&content);
+                        crate::clipboard::copy_to_system_clipboard_for_command(&content);
                     }
                     let mut cmd = "set-buffer".to_string();
                     if let Some(b) = buffer_name {
@@ -5916,9 +5993,14 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
                 }
                 return Ok(());
             }
-            // list-commands - List all commands (duplicate handled above but kept for match completeness)
+            // list-commands -F: expanded by the server's format engine.
             "list-commands" | "lscm" => {
-                print_commands();
+                let resp = send_control_with_response(format!("{}\n", crate::util::quoted_wire_line(&cmd_args)))?;
+                if let Some(msg) = resp.trim_start().strip_prefix("ERROR: ") {
+                    eprintln!("psmux: {}", msg.trim_end());
+                    std::process::exit(1);
+                }
+                print!("{}", resp);
                 return Ok(());
             }
             // set-hook - Set a hook
@@ -6082,7 +6164,7 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
             }
             // mouse-* - forward raw mouse events to the server (debug / testing aid)
             "mouse-down" | "mouse-drag" | "mouse-up" | "mouse-down-right" | "mouse-up-right"
-            | "pane-mouse" | "pane-scroll" | "copy-drag-begin" => {
+            | "pane-mouse" | "pane-scroll" | "pane-hwheel" | "copy-drag-begin" => {
                 let parts: Vec<String> = cmd_args.iter().map(|s| s.to_string()).collect();
                 send_control(format!("{}\n", parts.join(" ")))?;
                 return Ok(());
@@ -6816,6 +6898,10 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
     if let Some(on) = crate::rendering::blink_restore() {
         let _ = execute!(out, crossterm::style::Print(if on { "\x1b[?12h" } else { "\x1b[?12l" }));
     }
+    // The cursor colour back to the terminal's own, when this client set one.
+    if crate::rendering::cursor_colour_restore() {
+        let _ = execute!(out, crossterm::style::Print(crate::rendering::CURSOR_COLOUR_RESET));
+    }
     let _ = execute!(out, DisableMouseCapture, DisableBracketedPaste);
     // Leaves the alternate screen, or with `rmcup@` clears the main one (#700).
     crate::terminal_overrides::client_screen_stop(out);
@@ -7314,7 +7400,7 @@ fn command_line_error_exit(control_mode: u8, stderr_prefix: &str, msg: &str) -> 
         eprintln!("{}{}", stderr_prefix, msg);
         std::process::exit(1);
     }
-    let ts = chrono::Utc::now().timestamp();
+    let ts = jiff::Timestamp::now().as_second();
     let mut block = String::new();
     if control_mode == 2 {
         block.push_str("\x1bP1000p");

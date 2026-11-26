@@ -6,6 +6,7 @@
 
 param(
     [switch]$SkipPerf,       # Skip long-running perf/stress tests
+    [switch]$PerfOnly,       # Run only the perf group ($perfTests), then print the trend
     [switch]$IncludeWSL,     # Include WSL-dependent tests
     [switch]$IncludeInteractive, # Include tests that need interactive TUI
     [int]$DefaultTimeoutSec = 240,  # Per-suite timeout (normal suites)
@@ -570,6 +571,126 @@ $script:AuditImageFilter = "Name='cmd.exe' OR Name='conhost.exe' OR Name='OpenCo
 $script:AuditNeverKill = @('WindowsTerminal.exe')
 
 $script:AuditBaselineWins = @{}
+
+# A console window that opens DURING a suite is not always the suite's. On
+# 2026-11-16 the amesh daemon updated itself at 11:21 and its Task Scheduler
+# logon task started the new daemon, a console program, so Windows Terminal (the
+# default terminal) opened a window for it titled [claude]. The audit saw a new
+# CASCADIA window, closed it, and the daemon died with it; the amesh keeper
+# restarted the daemon 6 s later, inside the next suite, whose audit closed it
+# again: every suite from 645 on killed the mesh daemon once, and three agent
+# sessions on this machine dropped off the mesh. The window's owner pid is the
+# NEW WindowsTerminal.exe, which says nothing about whose console it shows, so
+# the audit now asks: for each process that started during the suite and whose
+# live parent chain reaches a system or shell process (Task Scheduler's svchost,
+# services, explorer) without passing through a terminal host, which window
+# shows its console? Those windows are protected. A suite's own clients are never
+# in that set: their parent is the suite's pwsh (gone by audit time, so the
+# chain breaks) or a terminal host the suite opened.
+# console_window_of.exe does the AttachConsole lookup in its own process, since
+# FreeConsole + AttachConsole in the runner would cost the runner its console.
+$script:ConsoleWindowOfExe = $null
+try {
+    $cwoSrc = Join-Path $PSScriptRoot 'helpers\console_window_of.cs'
+    $cwoExe = Join-Path $script:RunDir 'console_window_of.exe'
+    $csc = Join-Path ([Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory()) 'csc.exe'
+    if (-not (Test-Path $csc)) { $csc = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe' }
+    if ((Test-Path $cwoSrc) -and (Test-Path $csc)) {
+        & $csc /nologo /optimize /target:exe "/out:$cwoExe" $cwoSrc 2>&1 | Out-Null
+        if (Test-Path $cwoExe) { $script:ConsoleWindowOfExe = $cwoExe }
+    }
+} catch { }
+$script:AuditForeignRoots = @('svchost.exe', 'services.exe', 'wininit.exe', 'winlogon.exe', 'explorer.exe', 'sihost.exe', 'taskhostw.exe')
+$script:AuditTerminalHosts = @('WindowsTerminal.exe', 'OpenConsole.exe', 'conhost.exe', 'wezterm-gui.exe', 'alacritty.exe')
+
+# hwnd -> description of the foreign process whose console that window shows.
+# Also fills $script:AuditForeignPids (pid -> description), so pass 1 never ends
+# a foreign process either (a Task Scheduler `cmd /k` matches the parked console
+# rule, measured: the first version protected the window and pass 1 then killed
+# the cmd inside it).
+$script:AuditForeignPids = @{}
+
+# A suite can start a process that is not in its job and whose creator is not its
+# own (Win32_Process.Create makes it a child of WmiPrvSE, which walks up to
+# svchost). The foreign-root rule below rightly protects such a process, since a
+# Task Scheduler or daemon process looks the same, so on its own the audit could
+# never end it: test_runner_leftover_audit's Case B was left parked on the desktop
+# after every sweep since 95988cfa (PROTECTED ... started by svchost.exe).
+# The suite therefore DECLARES what it started, one "<pid><TAB><command line>" per
+# line, in the file named by PSMUX_TEST_DECLARED_PIDS. A declared pid is trusted
+# only while it is alive, was created after the suite started, and still has the
+# command line the suite recorded, so a declaration can never reach a process the
+# suite did not start (pid reuse included).
+function Get-DeclaredLeakFile {
+    param([string]$Suite)
+    return (Join-Path $script:SuiteDir "$Suite.declared_pids.txt")
+}
+function Get-DeclaredLeakPids {
+    param([string]$Suite, [datetime]$SuiteStart)
+    $ok = @{}
+    $file = Get-DeclaredLeakFile -Suite $Suite
+    if (-not (Test-Path $file)) { return $ok }
+    foreach ($line in (Get-Content $file -ErrorAction SilentlyContinue)) {
+        $f = $line -split "`t", 2
+        $q = 0
+        if ($f.Count -ne 2 -or -not [int]::TryParse($f[0].Trim(), [ref]$q)) { continue }
+        $p = Get-CimInstance -Query "SELECT ProcessId,CommandLine,CreationDate FROM Win32_Process WHERE ProcessId=$q" -ErrorAction SilentlyContinue
+        if (-not $p) { continue }
+        try { if (-not $p.CreationDate -or $p.CreationDate -lt $SuiteStart.AddSeconds(-2)) { continue } } catch { continue }
+        $cl = (([string]$p.CommandLine) -replace '\s+', ' ').Trim()
+        if ($cl -ne (($f[1] -replace '\s+', ' ').Trim())) { continue }
+        $ok[$q] = $true
+    }
+    return $ok
+}
+
+function Get-ForeignConsoleWindows {
+    param([datetime]$SuiteStart, [hashtable]$Declared = @{})
+    $result = @{}
+    $script:AuditForeignPids = @{}
+    try {
+        $all = @{}
+        foreach ($p in (Get-CimInstance -Query "SELECT ProcessId,ParentProcessId,Name,CreationDate FROM Win32_Process" -ErrorAction SilentlyContinue)) {
+            $all[[int]$p.ProcessId] = $p
+        }
+        $cands = @{}
+        foreach ($p in $all.Values) {
+            $procId = [int]$p.ProcessId
+            if ($script:AuditOwnPids.ContainsKey($procId)) { continue }
+            if ($Declared.ContainsKey($procId)) { continue }               # the suite says it started it
+            if ($script:AuditTerminalHosts -contains $p.Name) { continue }
+            try { if (-not $p.CreationDate -or $p.CreationDate -lt $SuiteStart.AddSeconds(-2)) { continue } } catch { continue }
+            # Walk LIVE parents. A parent that is already gone (the suite's own
+            # pwsh, usually) ends the walk: not provably foreign, so not protected.
+            $cur = [int]$p.ParentProcessId; $root = $null
+            for ($i = 0; $i -lt 8 -and $cur -gt 0; $i++) {
+                $pp = $all[$cur]
+                if (-not $pp) { break }
+                try { if ($pp.CreationDate -gt $p.CreationDate) { break } } catch { break }   # reused pid
+                if ($script:AuditOwnPids.ContainsKey($cur)) { break }
+                if ($script:AuditTerminalHosts -contains $pp.Name) { break }
+                if ($script:AuditForeignRoots -contains $pp.Name) { $root = "$($pp.Name) pid=$cur"; break }
+                $cur = [int]$pp.ParentProcessId
+            }
+            if ($root) { $cands[$procId] = "{0} pid={1} started by {2}" -f $p.Name, $procId, $root }
+        }
+        $script:AuditForeignPids = $cands
+        if ($cands.Count -eq 0 -or -not $script:ConsoleWindowOfExe) { return $result }
+        $psi = [Diagnostics.ProcessStartInfo]::new($script:ConsoleWindowOfExe, (($cands.Keys | ForEach-Object { "$_" }) -join ' '))
+        $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.CreateNoWindow = $true
+        $pr = [Diagnostics.Process]::Start($psi)
+        $out = $pr.StandardOutput.ReadToEnd()
+        [void]$pr.WaitForExit(5000)
+        foreach ($line in ($out -split "`r?`n")) {
+            $f = $line.Trim().Split(' ')
+            if ($f.Count -ne 2) { continue }
+            $h = 0L; $q = 0
+            if ([long]::TryParse($f[1], [ref]$h) -and [int]::TryParse($f[0], [ref]$q) -and $h -ne 0) { $result[$h] = $cands[$q] }
+        }
+    } catch { }
+    return $result
+}
+
 $script:AuditTotalLeftovers = 0
 $script:AuditSuitesWithLeftovers = 0
 $script:AuditLog = Join-Path $script:RunDir "leftovers.log"
@@ -670,9 +791,21 @@ function Invoke-LeftoverAudit {
     $newWinPids = @{}
     $newWins = @()
     try {
+        $candWins = @()
         foreach ($w in [PsmuxWinAudit]::List()) {
             if ($Before.Wins.ContainsKey([long]$w.Handle)) { continue }
             if (Test-AuditWindowProtected $w) { continue }
+            $candWins += $w
+        }
+        $declared = Get-DeclaredLeakPids -Suite $Suite -SuiteStart $SuiteStart
+        foreach ($d in $declared.Keys) { Write-AuditLine ("DECLARED {0} pid={1}: the suite says it started it outside its job" -f $Suite, $d) }
+        $foreign = Get-ForeignConsoleWindows -SuiteStart $SuiteStart -Declared $declared
+        foreach ($w in $candWins) {
+            if ($foreign.ContainsKey([long]$w.Handle)) {
+                Write-AuditLine ("PROTECTED-WINDOW {0} hwnd={1} pid={2} class={3} title=[{4}] shows the console of {5}; not the suite's, left alone" -f `
+                    $Suite, $w.Handle, $w.Pid, $w.Class, $w.Title, $foreign[[long]$w.Handle])
+                continue
+            }
             $newWins += $w
             $newWinPids[[int]$w.Pid] = $true
         }
@@ -694,6 +827,10 @@ function Invoke-LeftoverAudit {
             $isParked = ($p.Name -eq 'cmd.exe') -and ($cl -match '/c\s+pause\b' -or $cl -match '/k(\s|$)')
             $ownsWin  = $newWinPids.ContainsKey($procId)
             if (-not ($isParked -or $ownsWin)) { continue }
+            if ($script:AuditForeignPids.ContainsKey($procId)) {           # started by Task Scheduler, explorer...
+                Write-AuditLine ("PROTECTED {0} {1}; not the suite's, left alone" -f $Suite, $script:AuditForeignPids[$procId])
+                continue
+            }
 
             # Parent chain for attribution. Usually already dead by now, which is
             # exactly why spawn_trace.log (captured at spawn time) exists too.
@@ -773,7 +910,7 @@ function Invoke-LeftoverAudit {
 function Get-SuiteTimeout {
     param([string]$Name)
     # Perf/stress/latency suites legitimately run long; everything else gets the default.
-    if ($Name -match 'perf|stress|latency|benchmark|extreme|battle|install_speed|e2e|sustained|exhaustive|nsis|installer|realistic_typing|robust_|win32_tui_flag_parity|issue615_wsl_pane_path|issue684_paste_route|issue647_git_commit_in_version|issue693_targets|stalled_server_target_routing|issue835_status_tab_click_drift|issue943_failing_kinds_tcp') { return $LongTimeoutSec }
+    if ($Name -match 'perf|stress|latency|benchmark|extreme|battle|install_speed|e2e|sustained|exhaustive|nsis|installer|realistic_typing|robust_|win32_tui_flag_parity|issue615_wsl_pane_path|issue684_paste_route|issue647_git_commit_in_version|issue693_targets|stalled_server_target_routing|issue835_status_tab_click_drift|issue943_failing_kinds_tcp|ctrlc_private_bridge|issue1028_progress_bar_features') { return $LongTimeoutSec }
     return $DefaultTimeoutSec
 }
 
@@ -943,6 +1080,21 @@ if ($script:DefaultConfigs) {
     Write-Log "ABORT: default path config present: $($script:DefaultConfigs -join ', ')"
     exit 2
 }
+# Suites run with -NoNewWindow and share the runner's console, and a suite that
+# sets [Console]::OutputEncoding or InputEncoding (several read psmux's UTF-8
+# that way) calls SetConsoleOutputCP / SetConsoleCP on that console. Every
+# suite after it then ran at 65001 instead of the console's own page (OEM 437
+# in the launcher's window, as users have it), and a suite's result depended on
+# what ran before it (#570 failed under -Only only). Run-TestFile saves both
+# code pages before a suite and puts them back after it, whatever way it ends.
+function Save-SuiteConsoleEncoding {
+    try { return @{ Out = [Console]::OutputEncoding; In = [Console]::InputEncoding } } catch { return $null }
+}
+function Restore-SuiteConsoleEncoding($Saved) {
+    if (-not $Saved) { return }
+    try { [Console]::OutputEncoding = $Saved.Out } catch { }
+    try { [Console]::InputEncoding = $Saved.In } catch { }
+}
 $script:RunStartedAt = Get-Date
 
 $script:CurrentSuiteFile = Join-Path $script:RunDir "current_suite.txt"
@@ -987,7 +1139,11 @@ $perfTests = @(
     # Launches real terminal emulators (Windows Terminal, WezTerm, Alacritty) and
     # times psmux against them: launch to prompt, keystroke to screen, creation
     # latency. Long by nature, and it opens GUI windows, so -SkipPerf skips it.
-    "test_launch_to_prompt_gate", "test_keystroke_latency_gate", "test_creation_latency_gate", "test_idle_socket_traffic", "test_perf_vs_terminals"
+    "test_launch_to_prompt_gate", "test_keystroke_latency_gate", "test_creation_latency_gate", "test_idle_socket_traffic", "test_perf_vs_terminals",
+    # To the prompt VISIBLE in the console the user launched from (warm, cold,
+    # bare pwsh), and real typing into an attached client, per character and
+    # after Ctrl+C. Both write JSON to the metrics folder perf_summary reads.
+    "test_launch_visible_prompt_gate", "test_typing_benchmark"
 )
 
 # Results tracking
@@ -1311,6 +1467,7 @@ function Run-TestFile {
     Write-Host "  RUNNING: $baseName" -ForegroundColor White
     Write-Host "$('=' * 60)" -ForegroundColor DarkGray
 
+    $consoleEncoding = Save-SuiteConsoleEncoding
     try {
         # Run the test as a real child process inside a Windows Job Object.
         #  - stdout/stderr go straight to files: nothing ever blocks on a pipe,
@@ -1326,6 +1483,10 @@ function Run-TestFile {
         # anything already on screen is this suite's problem only if IT created it.
         $auditBefore = New-AuditSnapshot
         $auditStart  = Get-Date
+        # Where the suite may declare processes it started outside its job (see
+        # Get-DeclaredLeakPids). Inherited by the suite through the environment.
+        $env:PSMUX_TEST_DECLARED_PIDS = Get-DeclaredLeakFile -Suite $baseName
+        Remove-Item $env:PSMUX_TEST_DECLARED_PIDS -Force -ErrorAction SilentlyContinue
         # Tell the spawn watcher which suite owns the next burst of console starts.
         try { [System.IO.File]::WriteAllText($script:CurrentSuiteFile, $baseName) } catch { }
 
@@ -1422,6 +1583,20 @@ function Run-TestFile {
         if ($timedOut) {
             Write-Host "  [TIMEOUT] Killing $baseName process tree after ${timeoutSec}s" -ForegroundColor Red
             Write-Log "TIMEOUT $baseName after ${timeoutSec}s, killing process tree"
+            # What the suite was doing when it hung, taken before the kill erases
+            # it. Sweep 2026-11-20_02-33-04: test_issue642_ctrl_j_prefix hung with
+            # no output line and no console spawn at all (it passes in 120 s
+            # otherwise), and nothing left could say whether its pwsh had even
+            # started the script. CPU time and its live children answer that.
+            try {
+                $sp = Get-Process -Id $proc.Id -ErrorAction Stop
+                $kids = @(Get-CimInstance -Query "SELECT ProcessId,Name,CommandLine FROM Win32_Process WHERE ParentProcessId=$($proc.Id)" -ErrorAction SilentlyContinue |
+                    ForEach-Object { $c = ([string]$_.CommandLine) -replace '\s+', ' '; if ($c.Length -gt 120) { $c = $c.Substring(0, 120) }; "$($_.Name)#$($_.ProcessId)[$c]" })
+                $outLen = 0; try { $outLen = (Get-Item $outFile -ErrorAction Stop).Length } catch { }
+                Write-Log ("TIMEOUT-STATE {0} pid={1} cpu={2:F1}s threads={3} handles={4} stdout_bytes={5} children={6}" -f `
+                    $baseName, $proc.Id, $sp.TotalProcessorTime.TotalSeconds, $sp.Threads.Count, $sp.HandleCount, $outLen,
+                    $(if ($kids.Count) { $kids -join ' ' } else { '<none>' }))
+            } catch { Write-Log "TIMEOUT-STATE $baseName pid=$($proc.Id) could not be read: $($_.Exception.Message)" }
             if ($inJob) {
                 Write-KillNote ("JOBKILL timeout suite={0} assigned pid={1}" -f $baseName, $proc.Id)
                 [PsmuxTestJob]::Kill($job)   # kills every descendant, even orphans
@@ -1516,6 +1691,22 @@ function Run-TestFile {
 
         Write-Log ("{0,-7} {1,-45} {2}P/{3}F  exit={4}  {5}s{6}{7}" -f $status, $baseName, $passCount, $failCount, $exitCode, [math]::Round($sw.Elapsed.TotalSeconds,1), $(if ($leftovers -gt 0) { "  LEFTOVERS=$leftovers" } else { '' }), $uiNote)
 
+        # A failure names its first failing assertions and where the whole
+        # output is, right in progress.log and results.jsonl, so a sweep's
+        # failures can be read without hunting for the suite log.
+        $firstFails = @()
+        if ($status -ne "PASS") {
+            $plain = [regex]::Replace($output, '\x1b\[[0-9;?]*[ -/]*[@-~]', '')
+            $firstFails = @([regex]::Matches($plain, '(?m)^(?:.*(?:\[FAIL\]|\[TIMEOUT\]|=> FAIL$).*|\s*FAIL(?::(?!\s*\d+\s*$)|\s).*)$') |
+                Select-Object -First 3 | ForEach-Object { $t = $_.Value.Trim(); if ($t.Length -gt 300) { $t.Substring(0, 300) + '...' } else { $t } })
+            if ($firstFails.Count -eq 0 -and $plain.Trim()) {
+                # No marked assertion (a crash or a bare non zero exit): the tail says why.
+                $firstFails = @($plain.TrimEnd() -split "`r?`n" | Select-Object -Last 3 | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            }
+            foreach ($f in $firstFails) { Write-Log "  first failure: $f" }
+            Write-Log "  full output: $suiteLog"
+        }
+
         return @{
             Name = $baseName
             Status = $status
@@ -1526,6 +1717,8 @@ function Run-TestFile {
             Leftovers = $leftovers
             Duration = [math]::Round($sw.Elapsed.TotalSeconds, 1)
             Output = $output
+            FirstFailures = $firstFails
+            Log = $suiteLog
         }
     } catch {
         $sw.Stop()
@@ -1541,6 +1734,8 @@ function Run-TestFile {
             Duration = [math]::Round($sw.Elapsed.TotalSeconds, 1)
             Output = $_.ToString()
         }
+    } finally {
+        Restore-SuiteConsoleEncoding $consoleEncoding
     }
 }
 
@@ -1550,6 +1745,11 @@ $allTests = Get-ChildItem "$testRoot\test_*.ps1" | Sort-Object Name
 if ($Only) {
     $allTests = @($allTests | Where-Object { $_.BaseName -match $Only })
     Write-Log "Filter -Only '$Only' matched $($allTests.Count) suites"
+}
+if ($PerfOnly) {
+    if ($SkipPerf) { Write-Host "  -PerfOnly and -SkipPerf together run nothing; -SkipPerf ignored" -ForegroundColor Yellow; $SkipPerf = $false }
+    $allTests = @($allTests | Where-Object { $perfTests -contains $_.BaseName })
+    Write-Log "Filter -PerfOnly matched $($allTests.Count) suites"
 }
 $totalSuites = $allTests.Count
 Write-Host ""
@@ -1647,7 +1847,8 @@ foreach ($testFile in $allTests) {
     # Crash-safe per-suite result record (also powers -Resume)
     $rec = @{ Name=$result.Name; Status=$result.Status; Passed=$result.Passed;
               Failed=$result.Failed; Duration=$result.Duration; ExitCode=$result.ExitCode;
-              Leftovers=$(if ($result.Leftovers) { [int]$result.Leftovers } else { 0 }) } | ConvertTo-Json -Compress
+              Leftovers=$(if ($result.Leftovers) { [int]$result.Leftovers } else { 0 });
+              FirstFailures=@($result.FirstFailures | Where-Object { $_ }); Log=$result.Log } | ConvertTo-Json -Compress
     [System.IO.File]::AppendAllText($script:ResultsJsonl, "$rec`r`n")
 
     # Update live counters
@@ -1885,7 +2086,7 @@ $summaryLines = [System.Collections.ArrayList]::new()
 [void]$summaryLines.Add("Finished: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
 [void]$summaryLines.Add("Duration: $([math]::Round($totalDuration,1))s ($([math]::Round($totalDuration/60,1)) min)")
 [void]$summaryLines.Add("Binary:   $PSMUX")
-[void]$summaryLines.Add("Params:   SkipPerf=$SkipPerf IncludeWSL=$IncludeWSL IncludeInteractive=$IncludeInteractive")
+[void]$summaryLines.Add("Params:   SkipPerf=$SkipPerf PerfOnly=$PerfOnly IncludeWSL=$IncludeWSL IncludeInteractive=$IncludeInteractive")
 [void]$summaryLines.Add("")
 [void]$summaryLines.Add("Suites PASSED:  $($passed.Count)")
 [void]$summaryLines.Add("Suites FAILED:  $($failed.Count)")
@@ -1922,6 +2123,20 @@ if ($script:RunAborted) {
 Write-Log "Summary written to: $script:SummaryLog"
 Write-Log "Suite logs in:      $script:SuiteDir"
 Write-Log "=== Run finished ==="
+
+# Every perf suite writes its numbers as JSON under
+# %USERPROFILE%\.psmux-test-data\metrics (or PSMUX_METRICS_DIR). When this run
+# included any of them, read the history back and print the trend: each
+# headline number's newest value against the median of the five runs before
+# it. A reading, not a verdict: it never changes the exit code.
+$perfRan = @($results | Where-Object { $perfTests -contains $_.Name -and $_.Status -ne "SKIP" })
+if ($perfRan.Count -gt 0 -and (Test-Path "$PSScriptRoot\perf_summary.ps1")) {
+    $trendFile = Join-Path $script:RunDir "perf_trend.txt"
+    try {
+        & pwsh -NoProfile -File "$PSScriptRoot\perf_summary.ps1" -Metric T 2>&1 | Tee-Object -FilePath $trendFile | Out-Host
+        Write-Log "Perf trend written to: $trendFile"
+    } catch { Write-Log "perf_summary.ps1 failed: $_" }
+}
 
 Write-Host ""
 Write-Host "  Logs saved to: $script:RunDir" -ForegroundColor Cyan

@@ -196,7 +196,7 @@ fn focused_float_leaves_tiled_content_with_inactive_window_style() {
         alternate_screen: false,
         wants_mouse: false,
         hide_cursor: true,
-        cursor_shape: 0,
+        cursor_shape: 0, cursor_colour: None, default_colours: None,
         active: true,
         copy_mode: false,
         scroll_offset: 0,
@@ -210,7 +210,7 @@ fn focused_float_leaves_tiled_content_with_inactive_window_style() {
         copy_cursor_col: None,
         content: Vec::new(),
         rows_v2: Vec::new(),
-        title: None, copy_hl: Vec::new(), images: vec![],
+        title: None, clock: false, copy_hl: Vec::new(), images: vec![],
     };
     let window_styles = WindowContentStyles {
         inactive: Some(Style::default().bg(Color::DarkGray)),

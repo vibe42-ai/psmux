@@ -181,7 +181,10 @@ Start-Sleep -Seconds 3
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 $style = (& $PSMUX show-options -g -v status-style -t $sess 2>&1 | Out-String).Trim()
 $autorename = (& $PSMUX show-options -g -v automatic-rename -t $sess 2>&1 | Out-String).Trim()
-$escape = (& $PSMUX show-options -g -v escape-time -t $sess 2>&1 | Out-String).Trim()
+# history-limit, not escape-time: sensible's escape-time (10 since
+# psmux-plugins 1e4d6847) is also psmux's default, so it cannot show that the
+# plugin ran. Its history-limit 50000 differs from the default 2000.
+$history = (& $PSMUX show-options -g -v history-limit -t $sess 2>&1 | Out-String).Trim()
 $sw.Stop()
 
 if ($style -match "#3c3836|#ebdbb2") { Write-Pass "Gruvbox theme loaded synchronously (status-style='$style')" }
@@ -190,8 +193,8 @@ else { Write-Fail "Theme not sync: status-style='$style'" }
 if ($autorename -eq "off") { Write-Pass "User override preserved (automatic-rename=off)" }
 else { Write-Fail "User override lost (automatic-rename='$autorename')" }
 
-if ($escape -eq "50") { Write-Pass "Sensible default applied (escape-time=50)" }
-else { Write-Fail "Sensible not applied: escape-time='$escape'" }
+if ($history -eq "50000") { Write-Pass "Sensible default applied (history-limit=50000)" }
+else { Write-Fail "Sensible not applied: history-limit='$history'" }
 
 Write-Perf "3 option queries: $($sw.ElapsedMilliseconds)ms"
 
@@ -425,6 +428,22 @@ Write-Host ("  {0,-45} {1,10}" -f "WT render loop", "VSync ~60Hz")
 Write-Host ("  {0,-45} {1,10}" -f "WT mouse handling", "No throttle")
 Write-Host ("  {0,-45} {1,10}" -f "WT architecture", "In-process (no TCP)")
 Write-Host ""
+
+# The numbers above as JSON with the shared envelope, in the metrics folder
+# perf_summary.ps1 reads.
+. "$PSScriptRoot\perf_metrics_common.ps1"
+$jsonPath = Write-PerfMetrics -Suite "test_startup_perf" -Binary $PSMUX -FileStem "startup_perf" -Data ([ordered]@{
+    server_startup_bare_ms    = (Get-PerfStats $startupTimes 1)
+    server_startup_plugins_ms = (Get-PerfStats $pluginTimes 1)
+    bare_pwsh_ms              = (Get-PerfStats $barePwshTimes 1)
+    pane_command_echo_ms      = $(if ($marker_sent) { $marker_sent.ElapsedMilliseconds } else { $null })
+    tcp_show_options_ms       = (Get-PerfStats $tcpTimes 1)
+    tcp_dump_state_ms         = (Get-PerfStats $dumpTimes 1)
+    set_option_per_sec        = $opsPerSec
+    passed                    = $script:TestsPassed
+    failed                    = $script:TestsFailed
+})
+if ($jsonPath) { Write-Info "metrics: $jsonPath" }
 
 # ===========================================================================
 # CLEANUP

@@ -82,12 +82,28 @@ name = "issue641_scrollback_compaction"
 path = "tests/issue641_scrollback_compaction.rs"
 
 [[test]]
+name = "background_erase"
+path = "tests/background_erase.rs"
+
+[[test]]
 name = "issue685_osc4_palette"
 path = "tests/issue685_osc4_palette.rs"
 
 [[test]]
+name = "cursor_colour"
+path = "tests/cursor_colour.rs"
+
+[[test]]
+name = "default_colours"
+path = "tests/default_colours.rs"
+
+[[test]]
 name = "issue980_pane_colours"
 path = "tests/issue980_pane_colours.rs"
+
+[[test]]
+name = "clipboard_query"
+path = "tests/clipboard_query.rs"
 
 [[test]]
 name = "palette_queries"
@@ -114,6 +130,14 @@ name = "issue962_sgr_bold_dim_overline"
 path = "tests/issue962_sgr_bold_dim_overline.rs"
 
 [[test]]
+name = "passthrough_allowed"
+path = "tests/passthrough_allowed.rs"
+
+[[test]]
+name = "passthrough_discard"
+path = "tests/passthrough_discard.rs"
+
+[[test]]
 name = "replacement_character"
 path = "tests/replacement_character.rs"
 
@@ -133,8 +157,31 @@ path = "tests/line_drawing_charset.rs"
 name = "title_semicolon_stack"
 path = "tests/title_semicolon_stack.rs"
 
+[[test]]
+name = "progress_forms"
+path = "tests/progress_forms.rs"
+
+[[test]]
+name = "scroll_on_clear"
+path = "tests/scroll_on_clear.rs"
+
+[[test]]
+name = "tab_stops"
+path = "tests/tab_stops.rs"
+
+[[test]]
+name = "alt_screen_cursor"
+path = "tests/alt_screen_cursor.rs"
+
+[[test]]
+name = "scroll_region"
+path = "tests/scroll_region.rs"
+
 [dependencies.itoa]
-version = "1.0.18"
+version = "1.0.19"
+
+[dependencies.memchr]
+version = "2.8.3"
 
 [dependencies.unicode-width]
 version = "0.2.2"
@@ -143,14 +190,14 @@ version = "0.2.2"
 version = "0.15.0"
 
 [dev-dependencies.nix]
-version = "0.31.3"
+version = "0.32.0"
 features = ["term"]
 
 [dev-dependencies.quickcheck]
 version = "1.1.0"
 
 [dev-dependencies.rand]
-version = "0.10.3"
+version = "0.10.4"
 
 [dev-dependencies.serde]
 version = "1.0.229"
@@ -164,3 +211,7 @@ version = "0.4.4"
 
 
 
+
+[[test]]
+name = "host_notifications"
+path = "tests/host_notifications.rs"

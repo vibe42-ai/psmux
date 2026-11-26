@@ -519,7 +519,7 @@ pub(crate) fn dispatch(
                         String::new()
                     };
                     let windows = app.windows.len();
-                    let created = app.created_at.format("%a %b %e %H:%M:%S %Y");
+                    let created = crate::strftime::format("%a %b %e %H:%M:%S %Y", &app.created_at).unwrap_or_default();
                     let line = format!("{}: {} windows (created {}){}{}\n", app.session_name, windows, created, group, attached);
                     let _ = resp.send(line);
                 }
@@ -578,6 +578,7 @@ pub(crate) fn dispatch(
                         // environment, so it never changed anything, and it
                         // dropped a missing name instead of recording -NAME.
                         if let Some(src) = app.env_scopes.pending_client_environ.take() {
+                            app.client_registry.get_mut(&cid).unwrap().term = crate::terminal_overrides::environ_term(&src);
                             let patterns = app.update_environment.values();
                             crate::environ::update_environment(&mut app.environment, &mut app.env_scopes, &patterns, &src, false);
                         }
@@ -851,6 +852,15 @@ pub(crate) fn dispatch(
                                 "F1" | "F2" | "F3" | "F4" | "F5" | "F6" | "F7" | "F8" | "F9" | "F10" | "F11" | "F12"
                             ) || key_upper.starts_with("C-") || key_upper.starts_with("M-") || key_upper.starts_with("S-");
 
+                            // Named Enter shares the interactive pane transport. Keep
+                            // overlays on their existing mode-aware path and -l literal.
+                            if matches!(app.mode, Mode::Passthrough)
+                                && crate::input::enter_key_modifiers(key).is_some()
+                            {
+                                send_key_to_active(&mut app, key)?;
+                                continue;
+                            }
+
                             // Issue #860: a pane in an extended key mode gets
                             // tmux's extended form of a modified key
                             // (input-keys.c input_key) instead of the legacy
@@ -1053,7 +1063,9 @@ pub(crate) fn dispatch(
                                     send_text_to_active(&mut app, key)?;
                                     if i + 1 < parts.len() {
                                         let next_upper = parts[i + 1].to_uppercase();
-                                        let next_is_special = matches!(next_upper.as_str(),
+                                        let next_is_special = (matches!(app.mode, Mode::Passthrough)
+                                            && crate::input::enter_key_modifiers(parts[i + 1]).is_some())
+                                            || matches!(next_upper.as_str(),
                                             "ENTER" | "TAB" | "BTAB" | "BACKTAB" | "ESCAPE" | "ESC" | "SPACE" | "BSPACE" | "BACKSPACE" |
                                             "UP" | "DOWN" | "RIGHT" | "LEFT" | "HOME" | "END" |
                                             "PAGEUP" | "PPAGE" | "PAGEDOWN" | "NPAGE" | "DELETE" | "DC" | "INSERT" | "IC" |
@@ -2142,20 +2154,8 @@ pub(crate) fn dispatch(
                     let _ = resp.send(crate::environ::show(&app.environment, &app.env_scopes, &args));
                 }
                 // copied from server/mod.rs run_server (line 7737 at 86a78100)
-                CtrlReq::ShowHooks(resp) => {
-                    let mut output = String::new();
-                    for (name, commands) in &app.hooks {
-                        if commands.len() == 1 {
-                            output.push_str(&format!("{} -> {}\n", name, commands[0]));
-                        } else {
-                            for (i, cmd) in commands.iter().enumerate() {
-                                output.push_str(&format!("{}[{}] -> {}\n", name, i, cmd));
-                            }
-                        }
-                    }
-                    if output.is_empty() {
-                        output.push_str("(no hooks)\n");
-                    }
+                CtrlReq::ShowHooks(args, resp) => {
+                    let output = crate::show_hooks::format_show_hooks(&app.hooks, &crate::show_hooks::ShowHooksArgs::parse(&args));
                     let _ = resp.send(output);
                 }
                 // copied from server/mod.rs run_server (line 7717 at 86a78100)
@@ -2794,9 +2794,10 @@ pub(crate) fn dispatch(
                 // client redraws, against 0 while idle.  With this gate and the
                 // client-side one in client.rs it is 1, the same as idle.
                 // copied from server/mod.rs run_server (line 4365 at 86a78100)
-                CtrlReq::PaneMouse(cid, pane_id, button, col, row, press) => { if app.mouse_enabled { app.latest_client_id = Some(cid); let inert = crate::window_ops::pane_mouse_is_inert_motion(&app, pane_id, button); handle_pane_mouse(&mut app, pane_id, button, col, row, press); if button == 0 && press { crate::window_ops::note_pane_press(&mut app, pane_id, col, row); } if !inert { state_dirty = true; meta_dirty = true; echo_pending_until = Some(Instant::now()); } } }
+                CtrlReq::PaneMouse(cid, pane_id, button, col, row, press, replay) => { if app.mouse_enabled { app.latest_client_id = Some(cid); let inert = crate::window_ops::pane_mouse_is_inert_motion(&app, pane_id, button); let clock_closed = crate::window_ops::handle_client_pane_mouse(&mut app, pane_id, button, col, row, press, replay); hook_event = if clock_closed { Some("pane-mode-changed") } else { hook_event }; if !inert { state_dirty = true; meta_dirty = true; echo_pending_until = Some(Instant::now()); } } }
                 // copied from server/mod.rs run_server (line 4371 at 86a78100)
-                CtrlReq::PaneScroll(cid, pane_id, up, at, mods) => { if app.mouse_enabled { app.latest_client_id = Some(cid); crate::window_ops::handle_pane_wheel(&mut app, pane_id, up, at, mods); state_dirty = true; meta_dirty = true; echo_pending_until = Some(Instant::now()); } }
+                CtrlReq::PaneScroll(cid, pane_id, up, at, mods) => { if app.mouse_enabled { app.latest_client_id = Some(cid); let clock_closed = crate::window_ops::handle_pane_wheel(&mut app, pane_id, up, at, mods); hook_event = if clock_closed { Some("pane-mode-changed") } else { hook_event }; state_dirty = true; meta_dirty = true; echo_pending_until = Some(Instant::now()); } }
+                CtrlReq::PaneHWheel(cid, pane_id, right, at, mods) => { if app.mouse_enabled { app.latest_client_id = Some(cid); let clock_closed = crate::window_ops::handle_pane_hwheel(&mut app, pane_id, right, at, mods); hook_event = if clock_closed { Some("pane-mode-changed") } else { hook_event }; state_dirty = true; meta_dirty = true; } }
                 // copied from server/mod.rs run_server (line 4247 at 86a78100)
                 CtrlReq::CopyEnter => { enter_copy_mode(&mut app); hook_event = Some("pane-mode-changed"); }
                 // copied from server/mod.rs run_server (line 4248 at 86a78100)
@@ -3296,6 +3297,75 @@ pub(crate) fn dispatch(
                             let _ = resp.send(Err(msg));
                         }
                     }
+                }
+                // copied from server/mod.rs run_server (lines 8588 to 8606 at df7c6968)
+                CtrlReq::RespawnWindow(workdir, kill, command, resp, env_sets) => {
+                    let outcome = match crate::window_ops::respawn_window_refusal(&app, app.active_idx).filter(|_| !kill) {
+                        Some(cause) => Err(std::io::Error::new(std::io::ErrorKind::Other, cause)),
+                        None => {
+                            let idx = app.active_idx;
+                            if crate::window_ops::reduce_window_to_first_pane(&mut app, idx) > 0 {
+                                meta_dirty = true;
+                            }
+                            respawn_active_pane(&mut app, Some(pty_system), workdir.as_deref(), true, command.as_deref(), false, &env_sets)
+                        }
+                    };
+                    match outcome {
+                        Ok(()) => {
+                            state_dirty = true;
+                            let _ = resp.send(Ok(()));
+                        }
+                        Err(e) => {
+                            // tmux cmd-respawn-window.c: "respawn window failed: %s".
+                            let msg = format!("respawn window failed: {}", e);
+                            app.status_message = Some((msg.clone(), Instant::now(), None));
+                            state_dirty = true;
+                            let _ = resp.send(Err(msg));
+                        }
+                    }
+                }
+                // copied from server/mod.rs run_server (lines 8528 to 8543 at df7c6968)
+                CtrlReq::ResizeWindow(request, resp) => {
+                    match crate::resize_window::apply_resize_window(&mut app, &request) {
+                        Ok(resized) => {
+                            state_dirty = true;
+                            meta_dirty = true;
+                            if let Some(n) = control::layout_change(&app, resized.window_index, resized.area) {
+                                control::emit_notification(&app, n);
+                            }
+                            let _ = resp.send(Ok(()));
+                        }
+                        Err(error) => {
+                            let _ = resp.send(Err(error));
+                        }
+                    }
+                }
+                // copied from server/mod.rs run_server (lines 7530 to 7556 at df7c6968).
+                // The clients are this session's own (its registry), the way a
+                // per session server lists them; the CLI asks each session.
+                CtrlReq::ListClients(resp) => {
+                    let fmt = crate::format::default_list_clients_format();
+                    let _ = resp.send(crate::format::format_list_clients(&app, fmt, None));
+                }
+                CtrlReq::ListClientsFormat(resp, fmt, filter) => {
+                    let _ = resp.send(crate::format::format_list_clients(&app, &fmt, filter.as_deref()));
+                }
+                // copied from server/mod.rs run_server (lines 8090 to 8098 at df7c6968)
+                CtrlReq::RefreshClient => {
+                    app.shipped_image_ids.clear();
+                    crate::types::invalidate_delivered_frames();
+                    state_dirty = true;
+                    meta_dirty = true;
+                }
+                // copied from server/mod.rs run_server (lines 7345 to 7353 at df7c6968)
+                CtrlReq::FindWindow(resp, pattern) => {
+                    let mut output = String::new();
+                    for (i, win) in app.windows.iter().enumerate() {
+                        if win.name.contains(&pattern) {
+                            output.push_str(&format!("{}: {} []\n", app.win_display_index(i), win.name));
+                        }
+                    }
+                    let _ = resp.send(output);
                 }
                 // shared: everything else step 2 does not handle. A one shot
                 // command for it was refused by the router already, so what

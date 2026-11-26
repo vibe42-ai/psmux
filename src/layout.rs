@@ -161,6 +161,12 @@ pub struct CellJson {
     /// SGR 53 overline; written only when set, as `CellRunJson::ol` is.
     #[serde(default, skip_serializing_if = "crate::layout::is_false")]
     pub overline: bool,
+    /// OSC 8 hyperlink URI of this cell, if any (#1030).  Copy mode draws the
+    /// active pane from these cells, so without it every link scrolled into
+    /// view there came out dead.  Omitted when absent, so cells without a
+    /// link cost nothing extra on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -266,6 +272,18 @@ pub enum LayoutJson {
         hide_cursor: bool,
         #[serde(default)]
         cursor_shape: u8,
+        /// The colour the terminal is to draw the cursor in, as `#rrggbb`:
+        /// the program's (`OSC 12`), then the pane's `cursor-colour`. Absent
+        /// for the terminal's own, and in the fast path for every pane but
+        /// the active one, so an ordinary frame does not grow.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor_colour: Option<String>,
+        /// The default foreground and background the program set with
+        /// `OSC 10` and `OSC 11`, each `#rrggbb` or null, which the client
+        /// draws the pane's default colour cells with around the window
+        /// styles. Absent when the program set neither.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_colours: Option<[Option<String>; 2]>,
         active: bool,
         copy_mode: bool,
         scroll_offset: usize,
@@ -302,7 +320,42 @@ pub enum LayoutJson {
         /// top-level `image_blobs` map keyed by `ImageDescJson::id`.
         #[serde(default)]
         images: Vec<ImageDescJson>,
+        /// The pane is in clock mode (#1058): the focused pane while
+        /// `app.mode` is clock mode, or a pane the focus left with its clock
+        /// on (`AppState::clock_panes`). Absent when false, so an ordinary
+        /// frame does not grow.
+        #[serde(default, skip_serializing_if = "is_false")]
+        clock: bool,
     },
+}
+
+/// Which panes of the window being dumped show a clock (#1058). tmux keeps
+/// clock mode per pane and redraws each one from its own timer
+/// (`window_clock_timer_callback`, window-clock.c), so a pane the focus left
+/// keeps its clock on screen. psmux keeps the focused pane's clock in
+/// `app.mode` and the others in `app.clock_panes`.
+#[derive(Clone, Copy)]
+pub(crate) struct ClockMarks<'a> {
+    /// The focused pane of this window is in clock mode.
+    pub focused: bool,
+    /// Ids of the panes whose clock is parked while another pane has focus.
+    pub parked: &'a [usize],
+}
+
+impl ClockMarks<'_> {
+    /// The marks for window `win_idx`: `app.mode` belongs to the focused pane
+    /// of the active window only.
+    pub(crate) fn of(app: &AppState, win_idx: usize) -> ClockMarks<'_> {
+        ClockMarks {
+            focused: win_idx == app.active_idx && matches!(app.mode, crate::types::Mode::ClockMode),
+            parked: &app.clock_panes,
+        }
+    }
+
+    /// Whether pane `id` shows a clock; `is_active` says it has the focus.
+    pub(crate) fn shows(&self, id: usize, is_active: bool) -> bool {
+        (is_active && self.focused) || self.parked.contains(&id)
+    }
 }
 
 impl LayoutJson {
@@ -477,6 +530,8 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                             wants_mouse: false,
                             hide_cursor: true,
                             cursor_shape: 0,
+                            cursor_colour: None,
+                            default_colours: None,
                             active: *cur_path == active_path, copy_mode: false,
                             scroll_offset: 0,
                             view_offset: 0,
@@ -484,7 +539,7 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                             sel_end_row: None, sel_end_col: None,
                             sel_mode: None,
                             copy_cursor_row: None, copy_cursor_col: None,
-                            content: vec![], rows_v2: vec![], title: None, copy_hl: Vec::new(), images: vec![],
+                            content: vec![], rows_v2: vec![], title: None, copy_hl: Vec::new(), images: vec![], clock: false,
                         };
                     } else {
                         // Safety timeout expired without sentinel; unsquelch anyway.
@@ -499,6 +554,8 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                         wants_mouse: false,
                         hide_cursor: false,
                         cursor_shape: p.cursor_shape.load(std::sync::atomic::Ordering::Relaxed),
+                        cursor_colour: None,
+                        default_colours: None,
                         active: *cur_path == active_path, copy_mode: false,
                         scroll_offset: 0,
                         view_offset: 0,
@@ -506,7 +563,7 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                         sel_end_row: None, sel_end_col: None,
                         sel_mode: None,
                         copy_cursor_row: None, copy_cursor_col: None,
-                        content: vec![], rows_v2: vec![], title: None, copy_hl: Vec::new(), images: vec![],
+                        content: vec![], rows_v2: vec![], title: None, copy_hl: Vec::new(), images: vec![], clock: false,
                     };
                 };
                 let screen = parser.screen();
@@ -609,11 +666,15 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                             if need_full_content {
                                 let fg_str = crate::util::color_to_name(cell_fg).into_owned();
                                 let bg_str = crate::util::color_to_name(cell_bg).into_owned();
+                                let cell_uri = if cell_link != 0 {
+                                    screen.hyperlink_uri(cell_link).map(|s| s.to_string())
+                                } else { None };
                                 row.push(CellJson {
                                     text: t.to_string(), fg: fg_str.clone(), bg: bg_str.clone(),
                                     bold: cell.bold(), italic: cell.italic(),
                                     underline: cell.underline(), inverse: cell.inverse(), dim: cell.dim(),
                                     blink: cell.blink(), hidden: cell.hidden(), strikethrough: cell.strikethrough(), overline: cell.overline(),
+                                    link: cell_uri,
                                 });
                                 for _ in 1..w {
                                     row.push(CellJson {
@@ -621,6 +682,7 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                                         bold: cell.bold(), italic: cell.italic(),
                                         underline: cell.underline(), inverse: cell.inverse(), dim: cell.dim(),
                                         blink: cell.blink(), hidden: cell.hidden(), strikethrough: cell.strikethrough(), overline: cell.overline(),
+                                        link: None,
                                     });
                                 }
                             }
@@ -645,6 +707,7 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                                     text: " ".to_string(), fg: "default".to_string(), bg: "default".to_string(),
                                     bold: false, italic: false, underline: false, inverse: false, dim: false,
                                     blink: false, hidden: false, strikethrough: false, overline: false,
+                                    link: None,
                                 });
                             }
                             (1u16, vt100::Color::Default, vt100::Color::Default, 0u8, 0u32)
@@ -669,6 +732,7 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                                 blink: false,
                                 hidden: false,
                                 strikethrough: false, overline: false,
+                                link: None,
                             });
                         }
                         lines.push(row);
@@ -685,6 +749,8 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                     wants_mouse,
                     hide_cursor: hide_cursor_flag,
                     cursor_shape: p.cursor_shape.load(std::sync::atomic::Ordering::Relaxed),
+                    cursor_colour: screen.cursor_colour().map(cursor_colour_json),
+                    default_colours: default_colours_json(screen.program_default_colours()),
                     active: false,
                     // The pane's OWN mode (#607).  `mark_active` overwrites
                     // this for the focused pane with the live global mode.
@@ -703,6 +769,7 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                     title: if p.title.is_empty() { None } else { Some(p.title.clone()) },
                     copy_hl: Vec::new(),
                     images: vec![],
+                    clock: false,
                 }
             }
         }
@@ -822,6 +889,15 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
         if win_id_override.is_none() { app.copy_pos_scroll_offset } else { None },
         emacs,
     );
+    fn mark_clocks(node: &mut LayoutJson, marks: ClockMarks<'_>) {
+        match node {
+            LayoutJson::Leaf { id, active, clock, .. } => *clock = marks.shows(*id, *active),
+            LayoutJson::Split { children, .. } => {
+                for child in children { mark_clocks(child, marks); }
+            }
+        }
+    }
+    mark_clocks(&mut root, ClockMarks::of(app, win_idx));
     if in_copy_mode && win_id_override.is_none() {
         let hl = crate::copy_mode::copy_highlights(app);
         if !hl.is_empty() {
@@ -840,6 +916,20 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
         }
     }
     Ok(root)
+}
+
+/// A cursor colour as the layout JSON carries it, `#rrggbb`.
+fn cursor_colour_json((r, g, b): (u8, u8, u8)) -> String {
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
+
+/// A program's foreground and background (`Screen::program_default_colours`).
+type ProgramColours = (Option<(u8, u8, u8)>, Option<(u8, u8, u8)>);
+
+/// A program's default colours as the layout JSON carries them, `None` when
+/// it set neither.
+pub(crate) fn default_colours_json((fg, bg): ProgramColours) -> Option<[Option<String>; 2]> {
+    (fg.is_some() || bg.is_some()).then(|| [fg.map(cursor_colour_json), bg.map(cursor_colour_json)])
 }
 
 /// Direct JSON serialisation of the layout tree – writes JSON straight into
@@ -943,6 +1033,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
         sel_mode: crate::types::SelectionMode,
         emacs: bool,
         hl: &[[u16; 4]],
+        clocks: ClockMarks<'_>,
         out: &mut String,
     ) {
         match node {
@@ -961,7 +1052,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                 for (i, c) in children.iter_mut().enumerate() {
                     if i > 0 { out.push(','); }
                     cur_path.push(i);
-                    write_node(c, cur_path, active_path, in_copy, scroll_off, anchor, anchor_scroll, cpos, pos_scroll, sel_mode, emacs, hl, out);
+                    write_node(c, cur_path, active_path, in_copy, scroll_off, anchor, anchor_scroll, cpos, pos_scroll, sel_mode, emacs, hl, clocks, out);
                     cur_path.pop();
                 }
                 out.push_str("]}");
@@ -998,9 +1089,14 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                                 "\"active\":{},\"copy_mode\":false,",
                                 "\"scroll_offset\":0,",
                                 "\"view_offset\":0,",
-                                "\"rows_v2\":[],\"content\":[],\"images\":[],\"title\":null}}"),
+                                "\"rows_v2\":[],\"content\":[],\"images\":[],\"title\":null"),
                             p.id, p.last_rows, p.last_cols, is_active,
                         ));
+                        // The serde path marks a squelched leaf the same way.
+                        if clocks.shows(p.id, is_active) {
+                            out.push_str(",\"clock\":true");
+                        }
+                        out.push('}');
                         return;
                     } else {
                         p.squelch_until = None;
@@ -1025,7 +1121,10 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                 // in the ConPTY pipe while we build the JSON string.
                 struct Run { text: String, fg: vt100::Color, bg: vt100::Color, flags: u8, width: u16, link: Option<String>, ul: u8, ulc: vt100::Color, ol: bool }
                 struct RowSnap { runs: Vec<Run> }
-                struct CopyCell { text: String, fg: vt100::Color, bg: vt100::Color, bold: bool, italic: bool, underline: bool, inverse: bool, dim: bool, blink: bool, hidden: bool, strikethrough: bool, overline: bool, width: u16 }
+                // `link` is the cell's OSC 8 URI (#1030).  Shared between the
+                // cells of one link, so a linked cell costs a refcount bump,
+                // and `None` for every cell without one.
+                struct CopyCell { text: String, fg: vt100::Color, bg: vt100::Color, bold: bool, italic: bool, underline: bool, inverse: bool, dim: bool, blink: bool, hidden: bool, strikethrough: bool, overline: bool, width: u16, link: Option<std::rc::Rc<str>> }
                 struct LeafSnap {
                     cr: u16, cc: u16, alt: bool,
                     wants_mouse: bool,
@@ -1034,12 +1133,14 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                     rows_v2: Vec<RowSnap>,
                     content: Vec<Vec<CopyCell>>,
                     images: Vec<crate::server::helpers::ImageDesc>,
+                    cursor_colour: Option<(u8, u8, u8)>,
+                    default_colours: ProgramColours,
                 }
 
                 let snap = 'snap: {
                     let parser = match p.term.lock() {
                         Ok(g) => g,
-                        Err(_) => break 'snap LeafSnap { cr: 0, cc: 0, alt: false, wants_mouse: false, hide_cursor: false, view_offset: 0, rows_v2: vec![], content: vec![], images: vec![] },
+                        Err(_) => break 'snap LeafSnap { cr: 0, cc: 0, alt: false, wants_mouse: false, hide_cursor: false, view_offset: 0, rows_v2: vec![], content: vec![], images: vec![], cursor_colour: None, default_colours: (None, None) },
                     };
                     let screen = parser.screen();
                     // Issue #685: this pane's OSC 4 palette, read once for the
@@ -1157,6 +1258,11 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                     // Snapshot content (copy-mode only)
                     let mut snap_content: Vec<Vec<CopyCell>> = Vec::new();
                     if need_content {
+                        // Copy mode draws the pane from these cells, so they
+                        // must carry the hyperlink too, or every row drawn
+                        // after entering copy mode loses its link (#1030).
+                        // One URI lookup per link, not per cell.
+                        let mut link_cache: Option<(u32, Option<std::rc::Rc<str>>)> = None;
                         for r in 0..p.last_rows {
                             let mut row_cells: Vec<CopyCell> = Vec::new();
                             let mut c = 0u16;
@@ -1165,18 +1271,33 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                                     let t = cell.contents();
                                     let t = if t.is_empty() { " " } else { t };
                                     let w: u16 = if cell.is_wide() { 2 } else { 1 }; // #749: the grid's width
+                                    let clink = cell.hyperlink_id();
+                                    let link = if clink == 0 {
+                                        None
+                                    } else {
+                                        match &link_cache {
+                                            Some((id, uri)) if *id == clink => uri.clone(),
+                                            _ => {
+                                                let uri: Option<std::rc::Rc<str>> = screen.hyperlink_uri(clink).map(std::rc::Rc::from);
+                                                link_cache = Some((clink, uri.clone()));
+                                                uri
+                                            }
+                                        }
+                                    };
                                     row_cells.push(CopyCell {
                                         // Issue #685: copy mode paints the same
                                         // cells, so it resolves the palette too.
                                         text: t.to_string(), fg: pal_resolve(pal, cell.fgcolor()), bg: pal_resolve(pal, cell.bgcolor()),
                                         bold: cell.bold(), italic: cell.italic(), underline: cell.underline(),
                                         inverse: cell.inverse(), dim: cell.dim(), blink: cell.blink(), hidden: cell.hidden(), strikethrough: cell.strikethrough(), overline: cell.overline(), width: w,
+                                        link,
                                     });
                                     c += w;
                                 } else {
                                     row_cells.push(CopyCell {
                                         text: " ".to_string(), fg: vt100::Color::Default, bg: vt100::Color::Default,
                                         bold: false, italic: false, underline: false, inverse: false, dim: false, blink: false, hidden: false, strikethrough: false, overline: false, width: 1,
+                                        link: None,
                                     });
                                     c += 1;
                                 }
@@ -1194,7 +1315,10 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                         screen, p.last_rows, img_scroll_off,
                     );
 
-                    LeafSnap { cr, cc, alt, wants_mouse, hide_cursor, view_offset, rows_v2: snap_rows, content: snap_content, images }
+                    // Only the active pane's cursor is drawn.
+                    let cursor_colour = if is_active { screen.cursor_colour() } else { None };
+                    let default_colours = screen.program_default_colours();
+                    LeafSnap { cr, cc, alt, wants_mouse, hide_cursor, view_offset, rows_v2: snap_rows, content: snap_content, images, cursor_colour, default_colours }
                 };
                 // ── Parser mutex is now RELEASED ──
                 // All JSON string building below happens without holding the lock,
@@ -1220,6 +1344,17 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                     cs,
                     is_active, pane_in_copy, so, snap.view_offset,
                 ));
+                if let Some(rgb) = snap.cursor_colour {
+                    let _ = std::fmt::Write::write_fmt(out, format_args!("\"cursor_colour\":\"{}\",", cursor_colour_json(rgb)));
+                }
+                if let Some([fg, bg]) = default_colours_json(snap.default_colours) {
+                    let one = |c: Option<String>| c.map_or_else(|| "null".to_string(), |c| format!("\"{c}\""));
+                    let _ = std::fmt::Write::write_fmt(out, format_args!("\"default_colours\":[{},{}],", one(fg), one(bg)));
+                }
+                // Only a pane in clock mode carries the mark, as `cursor_colour`.
+                if clocks.shows(p.id, is_active) {
+                    out.push_str("\"clock\":true,");
+                }
 
                 // selection bounds + copy cursor position
                 if is_active && in_copy {
@@ -1318,6 +1453,12 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                                 cell.bold, cell.italic, cell.underline, cell.inverse, cell.dim, cell.blink, cell.hidden, cell.strikethrough,
                             ));
                             if cell.overline { out.push_str(",\"overline\":true"); }
+                            // Only linked cells grow a field (#1030).
+                            if let Some(uri) = &cell.link {
+                                out.push_str(",\"link\":\"");
+                                json_esc(uri, out);
+                                out.push('"');
+                            }
                             out.push('}');
                             // Emit width-2 filler cells
                             for _ in 1..cell.width {
@@ -1409,13 +1550,17 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
         }
     }
 
+    let focused_clock = matches!(app.mode, crate::types::Mode::ClockMode);
     let win = &mut app.windows[app.active_idx];
     let active_path = win.active_path.clone();
     let mut path = Vec::new();
     let mut out = String::with_capacity(32768);
+    // `ClockMarks::of` for the active window, spelt out so the borrow of
+    // `app.clock_panes` sits beside the mutable one of `app.windows`.
+    let clocks = ClockMarks { focused: focused_clock, parked: &app.clock_panes };
     write_node(
         &mut win.root, &mut path, &active_path,
-        in_copy, scroll_off, anchor, anchor_scroll, cpos, pos_scroll, sel_mode, emacs, &hl, &mut out,
+        in_copy, scroll_off, anchor, anchor_scroll, cpos, pos_scroll, sel_mode, emacs, &hl, clocks, &mut out,
     );
     Ok(out)
 }
@@ -1850,6 +1995,10 @@ mod test_issue361_serialize_hyperlink;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue361_fastdump_hyperlink.rs"]
 mod test_issue361_fastdump_hyperlink;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue1030_copy_mode_hyperlink.rs"]
+mod test_issue1030_copy_mode_hyperlink;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue685_pane_palette.rs"]

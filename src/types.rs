@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crossterm::event::{KeyCode, KeyModifiers};
 use portable_pty::MasterPty;
 use ratatui::prelude::Rect;
-use chrono::Local;
+
 use crate::terminal_features::TerminalFeatures;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -133,6 +133,9 @@ pub struct ClientInfo {
     pub is_control: bool,
     /// Terminal capabilities reported at attach, including unknown bits.
     pub termfeatures: TerminalFeatures,
+    /// TERM in the client's environment at attach, empty when it has none,
+    /// which `terminal-features` patterns match against (tty-term.c:627).
+    pub term: String,
     /// The session THIS client was in before it switched here, if any.
     ///
     /// psmux runs one server per session, so a switch tears the client off one
@@ -270,7 +273,7 @@ pub struct DeadInfo {
     /// empty and the code is always the status.
     pub status: u32,
     /// When the pane died, the time tmux keeps in `wp->dead_time`.
-    pub time: chrono::DateTime<chrono::Local>,
+    pub time: jiff::Timestamp,
 }
 
 /// Which client a format is expanded for (`display-message -c`, issue #724).
@@ -591,6 +594,16 @@ impl Pane {
         self.live_term.as_ref().unwrap_or(&self.term)
     }
 
+    /// The pane's OSC 9;4 state and value, hidden and 0 until it sets one, as
+    /// tmux's `screen_reinit` starts them (screen.c:139 at tag 3.8).
+    pub fn progress(&self) -> (u8, u8) {
+        self.live_parser()
+            .lock()
+            .ok()
+            .and_then(|parser| parser.screen().progress())
+            .unwrap_or((0, 0))
+    }
+
     /// The view parser plus, while a copy-mode snapshot is installed, the live
     /// parser behind it.
     ///
@@ -628,6 +641,13 @@ pub struct CwdHint {
     /// Latched once a reading other than `stale` is seen, so a later `cd` back
     /// into `stale` cannot resurrect the hint.
     pub settled: std::sync::atomic::AtomicBool,
+    /// The injected `cd` moves the WIN32 working directory too, so once its
+    /// trailing clear has reached the parser the PEB reading is the truth.
+    /// True for PowerShell (the rehome line calls `SetCurrentDirectory`) and
+    /// cmd.exe.  False for POSIX shells: Git Bash's `cd` moves only its own
+    /// cwd, the PEB keeps the pool's directory forever, and the request is the
+    /// only right answer (test_issue672).
+    pub reading_follows_cd: bool,
 }
 
 /// Pre-spawned shell ready to be transplanted into a new window instantly.
@@ -1256,6 +1276,34 @@ impl WarmPool {
         }
         self.spares = dropped;
         before - self.spares.len()
+    }
+    /// Give the lowest reserved pane id to a creation that cannot use a spare
+    /// (it runs a command, has `-e`, or the default shell is dynamic), and
+    /// retire only the one spare that held it.
+    ///
+    /// Such a creation used to take `next_pane_id`, which is above every id the
+    /// pooled spares reserved, so [`WarmPool::set_issued_floor`] then had to kill
+    /// the WHOLE pool and the refill booted three fresh shells beside the
+    /// command the user was waiting on: `new-window cmd` and `split-window cmd`
+    /// reached their command ~200 ms later than with the pool off. Taking the
+    /// front spare's id instead keeps the visible sequence in creation order
+    /// (the front is the lowest outstanding id) and leaves every other spare
+    /// valid.
+    ///
+    /// Only when nothing is in flight: a refill still inside `CreateProcessW`
+    /// may hold a lower id than the front, and handing out the front would put
+    /// that one in the past. The caller falls back to `next_pane_id` and
+    /// [`WarmPool::set_issued_floor`] then, as before.
+    pub fn yield_front_id(&mut self) -> Option<usize> {
+        if self.inflight > 0 {
+            return None;
+        }
+        let mut wp = self.spares.pop_front()?;
+        let id = wp.pane_id;
+        // Retired exactly as `set_issued_floor` retires a spare.
+        wp.child.kill().ok();
+        self.note_issued(id);
+        Some(id)
     }
     pub fn issued_floor(&self) -> usize {
         self.issued_floor
@@ -1942,6 +1990,10 @@ pub struct AppState {
     pub copy_register_pending: bool,
     /// Currently selected named register (a-z), None = default unnamed
     pub copy_register: Option<char>,
+    /// A paste of the OS clipboard (empty paste stack, #428) still waiting for
+    /// a clipboard another window holds open.  The server loop holds every
+    /// later request behind it so nothing overtakes the paste.
+    pub clipboard_paste_pending: Option<crate::commands::PendingClipboardPaste>,
     /// Copy-mode mark set by `X` (set-mark): (scroll_offset, row, col).
     /// `M-x` (jump-to-mark) swaps the cursor with it, so pressing it twice
     /// returns you to where you started, same as tmux (#498).
@@ -2054,7 +2106,7 @@ pub struct AppState {
     /// The command lines waiting for their prompt (no `-b`), by request id:
     /// each gets its reply when the prompt closes, as tmux's client waits.
     pub prompt_waiters: Vec<(u64, std::sync::mpsc::Sender<String>)>,
-    pub created_at: chrono::DateTime<Local>,
+    pub created_at: jiff::ZonedDateTime,
     pub next_win_id: usize,
     pub next_pane_id: usize,
     /// Pane ids already auto-healed once by `@heal-crashed-panes`. A pane is
@@ -2258,6 +2310,12 @@ pub struct AppState {
     /// pane-colours (#980): the global window array and every window's and
     /// pane's own table.
     pub pane_colours: crate::pane_colours::PaneColours,
+    /// What crate::scroll_on_clear has pushed into the panes.
+    pub scroll_on_clear: crate::scroll_on_clear::ScrollOnClear,
+    /// What crate::cursor_colour has pushed into the panes.
+    pub cursor_colour: crate::cursor_colour::CursorColourOption,
+    /// What crate::style_colours has pushed into the panes.
+    pub style_colours: crate::style_colours::StyleColours,
     /// window-size: "smallest", "largest", "manual", "latest" (default "latest")
     pub window_size: String,
     /// Requested manual geometry, keyed by window ID. The visible geometry may
@@ -2265,6 +2323,7 @@ pub struct AppState {
     pub manual_window_sizes: std::collections::HashMap<usize, (u16, u16)>,
     /// allow-passthrough: "on", "off", "all" (default "off")
     pub allow_passthrough: String,
+    pub host_events: crate::frame_oneshot::OneShots,
     /// copy-command: command to pipe yanked text to (default empty)
     pub copy_command: String,
     /// command-alias: the server ARRAY option, shared with the connection
@@ -2815,6 +2874,7 @@ impl AppState {
                 TerminalFeatures::COLOR_256.bits() | TerminalFeatures::RGB.bits()
                     | TerminalFeatures::HYPERLINKS.bits() | TerminalFeatures::TITLE.bits(),
             ),
+            term: String::new(),
             last_session: None,
             pid: pid.unwrap_or(0),
             readonly: false,
@@ -3513,6 +3573,7 @@ impl AppState {
             copy_text_object_pending: None,
             copy_register_pending: false,
             copy_register: None,
+            clipboard_paste_pending: None,
             copy_mark: None,
             copy_last_jump: None,
             copy_refresh_live: false,
@@ -3555,7 +3616,7 @@ impl AppState {
             prompt_request: None,
             prompt_request_seq: 0,
             prompt_waiters: Vec::new(),
-            created_at: Local::now(),
+            created_at: crate::strftime::now(),
             next_win_id: 1,
             next_pane_id: 1,
             healed_pane_ids: std::collections::HashSet::new(),
@@ -3644,12 +3705,16 @@ impl AppState {
             status_right_length: 40,
             status_lines: 1,
             pane_colours: crate::pane_colours::PaneColours::default(),
+            scroll_on_clear: crate::scroll_on_clear::ScrollOnClear::default(),
+            cursor_colour: crate::cursor_colour::CursorColourOption::default(),
+            style_colours: crate::style_colours::StyleColours::default(),
             status_format: crate::option_array::OptionArray::with_default(
                 crate::option_array::spec("status-format").expect("status-format is in ARRAY_OPTIONS"),
             ),
             window_size: "latest".to_string(),
             manual_window_sizes: std::collections::HashMap::new(),
             allow_passthrough: "off".to_string(),
+            host_events: Default::default(),
             copy_command: String::new(),
             command_aliases: std::sync::Arc::new(std::sync::RwLock::new(
                 crate::command_alias::CommandAliases::with_defaults(),
@@ -4153,8 +4218,11 @@ pub enum CtrlReq {
     ScrollUp(u64,u16, u16),
     ScrollDown(u64,u16, u16),
     /// Client-side semantic mouse event: pane-relative coordinates, targeted by pane ID.
-    /// Fields: client_id, pane_id, sgr_button, col_0based, row_0based, press
-    PaneMouse(u64, usize, u8, i16, i16, bool),
+    /// Fields: client_id, pane_id, sgr_button, col_0based, row_0based, press,
+    /// replay. `replay` marks a press the client sends again for a gesture the
+    /// server already saw go down (`pane-mouse ... R`, mouse-drag-enter-copy-mode
+    /// anchoring its selection): it is not a new click (#1031).
+    PaneMouse(u64, usize, u8, i16, i16, bool, bool),
     /// Client-side semantic scroll: targeted by pane ID.
     /// Fields: client_id, pane_id, up (true=up, false=down), pointer position as
     /// pane-relative 0-based (col, row).  The position is optional because older
@@ -4163,6 +4231,9 @@ pub enum CtrlReq {
     /// pane-scroll: client, pane, up, pointer cell, tmux modifier mask
     /// (shift 4, meta 8, ctrl 16; 0 from an older client).
     PaneScroll(u64, usize, bool, Option<(i16, i16)>, u8),
+    /// A horizontal wheel notch over a pane (#1036): client id, pane id,
+    /// right (else left), pane relative position, tmux modifier mask.
+    PaneHWheel(u64, usize, bool, Option<(i16, i16)>, u8),
     /// send-keys -M: forward the mouse event that triggered the running
     /// mouse binding to its pane (tmux cmd-send-keys.c).
     SendMouse(u64),
@@ -4779,7 +4850,7 @@ pub enum CtrlReq {
     ShowEnvironment(crate::environ::ShowEnvArgs, mpsc::Sender<Result<String, String>>),
     SetHook(String, String),
     AppendHook(String, String),
-    ShowHooks(mpsc::Sender<String>),
+    ShowHooks(Vec<String>, mpsc::Sender<String>),
     RemoveHook(String),
     /// End THIS server only. What a one-shot CLI connection asks for: the CLI
     /// has already worked out the scope and is fanning the request out itself,
@@ -4846,7 +4917,7 @@ pub enum CtrlReq {
     /// (issue #640); the attached client sends its own latch updates over the
     /// persistent connection and passes `None`.
     SwitchClientTable(String, Option<mpsc::Sender<String>>),
-    ListCommands(mpsc::Sender<String>),
+    ListCommands(Vec<String>, mpsc::Sender<String>),
     ResizeWindow(
         crate::resize_window::ResizeWindowRequest,
         mpsc::Sender<Result<(), String>>,
@@ -4859,13 +4930,14 @@ pub enum CtrlReq {
         window_id: Option<usize>,
         size: Option<(u16, u16)>,
     },
-    /// respawn-window. Fields: optional workdir (-c), optional shell-command
-    /// operand, per-request reply. Shares `respawn_active_pane` with
+    /// respawn-window. Fields: optional workdir (-c), `-k` (without it a
+    /// window with a live pane is refused, tmux spawn.c "window s:i still
+    /// active"), optional shell-command operand, per-request reply. Shares `respawn_active_pane` with
     /// `RespawnPane` and therefore shared its server-killing `?`; the spawn
     /// failures (bad `-c`, unspawnable command) are routine and belong to the
     /// requesting client. tmux: `respawn window failed: <cause>`, exit 1.
     /// The last field is the `-e KEY=VALUE` environment (#708).
-    RespawnWindow(Option<String>, Option<String>, mpsc::Sender<Result<(), String>>, Vec<(String, String)>),
+    RespawnWindow(Option<String>, bool, Option<String>, mpsc::Sender<Result<(), String>>, Vec<(String, String)>),
     FocusIn,
     FocusOut,
     /// `command-prompt <args>` from the command line (#789 follow up): open
@@ -5442,7 +5514,7 @@ pub fn shutdown_client_stream(client_id: u64) {
         });
     }
     if let Ok(mut v) = FRAME_PUSH_SLOTS.lock() {
-        v.retain(|(cid, _, _)| *cid != client_id);
+        v.retain(|r| r.client_id != client_id);
     }
     remove_directive_channel(client_id);
 }
@@ -5496,7 +5568,17 @@ pub enum WriterWake {
     Frame,
 }
 
-static FRAME_PUSH_SLOTS: std::sync::Mutex<Vec<(u64, FrameSlot, mpsc::Sender<WriterWake>)>> =
+/// One persistent client's push slot.
+struct FrameReceiver {
+    client_id: u64,
+    slot: FrameSlot,
+    poke: mpsc::Sender<WriterWake>,
+    /// [`frame_key`] of the last frame this client was given (pushed, or
+    /// answered to its own dump-state), `None` before the first one.
+    last_key: Option<u64>,
+}
+
+static FRAME_PUSH_SLOTS: std::sync::Mutex<Vec<FrameReceiver>> =
     std::sync::Mutex::new(Vec::new());
 
 /// Register a frame slot for a persistent connection's writer thread.
@@ -5506,9 +5588,91 @@ static FRAME_PUSH_SLOTS: std::sync::Mutex<Vec<(u64, FrameSlot, mpsc::Sender<Writ
 pub fn register_frame_channel(client_id: u64, poke: mpsc::Sender<WriterWake>) -> FrameSlot {
     let slot: FrameSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
     if let Ok(mut v) = FRAME_PUSH_SLOTS.lock() {
-        v.push((client_id, slot.clone(), poke));
+        v.push(FrameReceiver { client_id, slot: slot.clone(), poke, last_key: None });
     }
     slot
+}
+
+/// What identifies a frame's content for [`frame_owed`]: a hash of the
+/// whole line, or `None` when it carries a one shot (bell, clipboard write,
+/// image bytes). Those are events, not screen state, so such a frame is
+/// always delivered even when an earlier frame looked the same.
+pub(crate) fn frame_key(frame: &str) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut probe = frame.to_string();
+    if !crate::frame_oneshot::take(&mut probe).is_empty() {
+        return None;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    frame.hash(&mut h);
+    Some(h.finish())
+}
+
+/// Whether a client must be sent a frame whose key is `key`.
+///
+/// tmux redraws a client only when something it shows changed: a command
+/// that changes nothing (a `list-sessions`, a `show-options`, a
+/// `display-message -p` from a script polling the session) puts nothing on
+/// the client's tty. Here every request used to end in a pushed frame, so
+/// anything querying a session once a second sent its attached clients a
+/// byte for byte copy of the screen they already had, and the client parsed
+/// and repainted all of it (the #232 status-interval suite saw a second frame
+/// tens of milliseconds after each real one).
+///
+/// The same content is skipped only when the client already has it and
+/// nothing older is still waiting in its slot: an unread older frame must be
+/// replaced, or the writer would put the stale screen on the wire last.
+pub(crate) fn frame_owed(last_key: Option<u64>, key: Option<u64>, slot_pending: bool) -> bool {
+    match key {
+        None => true,
+        Some(k) => slot_pending || last_key != Some(k),
+    }
+}
+
+impl CtrlReq {
+    /// A request that only reads state and answers on its channel: it
+    /// changes nothing an attached client draws, so it owes no frame (tmux
+    /// redraws nothing for a `list-sessions`, a `show-options` or a
+    /// `display-message -p`). list-windows, list-panes and display-message
+    /// copy the panes' OSC titles over before they read; their arms mark the
+    /// frame dirty themselves when that changed a title. A display-message
+    /// that shows its text on the status line is not a query.
+    pub(crate) fn is_read_only_query(&self) -> bool {
+        matches!(self,
+            CtrlReq::DisplayMessage(_, _, _, false, ..)
+            | CtrlReq::DisplayMessageById(_, _, _, false, ..)
+            | CtrlReq::ListWindows(_)
+            | CtrlReq::ListWindowsTmux(_)
+            | CtrlReq::ListWindowsFormat(..)
+            | CtrlReq::ListPanes(_)
+            | CtrlReq::ListPanesFormat(..)
+            | CtrlReq::ListAllPanes(_)
+            | CtrlReq::ListAllPanesFormat(..)
+            | CtrlReq::CapturePane(..)
+            | CtrlReq::CapturePaneStyled(..)
+            | CtrlReq::CapturePaneRange(..)
+            // A -t lookup; a failed one marks the frame dirty itself for
+            // the status line error.
+            | CtrlReq::ValidateTarget { .. }
+            | CtrlReq::ResolveTarget { .. }
+            | CtrlReq::SessionInfo(_)
+            | CtrlReq::SessionInfoFormat(..)
+            | CtrlReq::HasSession(_)
+            | CtrlReq::ListTree(_)
+            | CtrlReq::DumpLayout(_)
+            | CtrlReq::ExpandFormat(..)
+            | CtrlReq::SessionOptionQuery(..)
+            | CtrlReq::ScopeSessionListing(..)
+            | CtrlReq::ShowOptions(_)
+            | CtrlReq::ShowWindowOptions(_)
+            | CtrlReq::ListKeys(_)
+            | CtrlReq::ListKeyNotes(..)
+            | CtrlReq::ListBuffers(_)
+            | CtrlReq::ListBuffersFormat(..)
+            | CtrlReq::ShowBuffer(_)
+            | CtrlReq::ShowNamedBuffer(..)
+        )
+    }
 }
 
 /// Push a serialized frame to all persistent clients.
@@ -5516,11 +5680,57 @@ pub fn register_frame_channel(client_id: u64, poke: mpsc::Sender<WriterWake>) ->
 /// the latest matters. The lock is held only for the duration of an
 /// Option::replace, never across I/O.
 /// Dead slots (poisoned mutex) are pruned automatically.
+/// A client that already has this exact frame is not sent it again
+/// ([`frame_owed`]).
 pub fn push_frame(frame: &str) {
+    push_frame_inner(frame, None);
+}
+
+/// Forget what every client was last given, so the next frame reaches all
+/// of them even if nothing in it changed: `refresh-client` asks for exactly
+/// that redraw, and an attach or a client resize repaints from scratch.
+pub fn invalidate_delivered_frames() {
     if let Ok(mut slots) = FRAME_PUSH_SLOTS.lock() {
-        slots.retain(|(_, slot, poke)| {
+        for r in slots.iter_mut() {
+            r.last_key = None;
+        }
+    }
+}
+
+/// Fan out a dump-state reply. The requester keeps its confirming screen
+/// push, but its one-shots travel only in the reply. Any older unread events
+/// move out of its slot into that reply, before the newer reply's events.
+pub fn push_frame_answered(frame: &mut String, answered: Option<u64>) {
+    let mut carried = push_frame_inner(frame, answered);
+    if !carried.is_empty() {
+        carried.merge_newer(crate::frame_oneshot::take(frame));
+        crate::frame_oneshot::append(frame, &carried);
+    }
+}
+
+/// Keep the new frame immutable throughout fanout: events carried from the
+/// requester's slot belong to its reply, never to another client's frame.
+fn push_frame_inner(frame: &str, answered: Option<u64>) -> crate::frame_oneshot::OneShots {
+    let key = frame_key(frame);
+    let mut carried = crate::frame_oneshot::OneShots::default();
+    if let Ok(mut slots) = FRAME_PUSH_SLOTS.lock() {
+        slots.retain_mut(|r| {
+            let FrameReceiver { client_id, slot, poke, last_key } = r;
             match slot.lock() {
                 Ok(mut s) => {
+                    // The client whose dump-state this answers is pushed the
+                    // frame as well, always: readers confirm a state by the
+                    // pushed copy that follows the reply (the creation timers
+                    // in test_perf_vs_terminals wait for two matching frames
+                    // and nudge with dump-state in between), as they always
+                    // got it. A full reply is built only when something
+                    // changed or the client has never had one, so this is one
+                    // copy per real change, not one per poll.
+                    let requester = Some(*client_id) == answered;
+                    if !requester && !frame_owed(*last_key, key, s.is_some()) {
+                        return true;
+                    }
+                    *last_key = key;
                     // Only an empty->full transition needs a poke. If a frame
                     // is already waiting the writer has not drained it yet, so
                     // it is either running or already has a wake queued: this
@@ -5531,7 +5741,15 @@ pub fn push_frame(frame: &str) {
                     // An unread frame being replaced keeps its clipboard
                     // write and bell (frame_oneshot): they are events, not
                     // screen state, and the newer snapshot does not have them.
-                    if let Some(mut older) = s.take() {
+                    if requester {
+                        // The connection writer sends replies before its slot.
+                        // Move older events to that ordered carrier, and omit
+                        // the new reply's events from the confirming push.
+                        crate::frame_oneshot::take(&mut frame);
+                        if let Some(mut older) = s.take() {
+                            carried.merge_newer(crate::frame_oneshot::take(&mut older));
+                        }
+                    } else if let Some(mut older) = s.take() {
                         crate::frame_oneshot::supersede(&mut older, &mut frame);
                     }
                     *s = Some(frame);
@@ -5545,6 +5763,7 @@ pub fn push_frame(frame: &str) {
             }
         });
     }
+    carried
 }
 
 /// Check if any persistent clients are registered for push.
@@ -5557,7 +5776,7 @@ pub fn has_frame_receivers() -> bool {
 /// returns false when no live clients remain.
 pub fn deregister_frame_channel(client_id: u64) {
     if let Ok(mut v) = FRAME_PUSH_SLOTS.lock() {
-        v.retain(|(cid, _, _)| *cid != client_id);
+        v.retain(|r| r.client_id != client_id);
     }
 }
 
@@ -5680,6 +5899,10 @@ pub struct ParsedTarget {
 #[cfg(test)]
 #[path = "../tests-rs/test_pr267_backpressure_proof.rs"]
 mod tests_pr267_backpressure;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue232_unchanged_frame.rs"]
+mod tests_issue232_unchanged_frame;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_client_connection_teardown.rs"]

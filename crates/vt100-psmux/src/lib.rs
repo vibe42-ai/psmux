@@ -60,6 +60,7 @@ mod grid;
 pub mod image;
 mod palette;
 mod parser;
+mod passthrough;
 mod perform;
 mod program_status;
 mod queries;
@@ -74,11 +75,18 @@ pub use cell::Cell;
 pub use image::SixelImage;
 pub use palette::{parse_palette_index, parse_x11_colour, xterm_rgb, ColourPalette};
 pub use parser::Parser;
-pub use perform::{input_buffer_size, set_input_buffer_size, DEFAULT_INPUT_BUFFER_SIZE};
+pub use perform::{
+    allow_passthrough, conhost_c0_cells_default, conhost_win10_default, input_buffer_size,
+    set_allow_passthrough, set_conhost_c0_cells_default, set_conhost_win10_default,
+    set_input_buffer_size, DEFAULT_INPUT_BUFFER_SIZE,
+};
 pub use queries::{QueryDetector, MAX_PENDING_QUERIES};
 pub use program_status::{ProgramKind, ProgramRecord, ProgramState, ProgramStatus, ProgramStatuses, TerminalQuery, PROGRAM_STATUS_REPLY};
-pub use screen::{extended_keys_option, set_extended_keys_option, xtmodkeys_off_mode, xtmodkeys_set_mode, MouseProtocolEncoding, MouseProtocolMode, Screen};
+pub use screen::{extended_keys_option, set_extended_keys_option, xtmodkeys_off_mode, xtmodkeys_set_mode, MouseProtocolEncoding, MouseProtocolMode, Screen, StyleColour};
 pub use width::{
     char_width, clear_codepoint_widths, has_overrides, parse_entry as parse_codepoint_width_entry,
     set_codepoint_widths, str_cells, str_width, WidthOverride, MAX_OVERRIDE_WIDTH,
 };
+
+mod host_events;
+pub use host_events::{host_events_pending, HostEvent, MAX_HOST_EVENT_BYTES};

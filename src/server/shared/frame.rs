@@ -129,6 +129,8 @@ fn build_frame(app: &mut AppState, c: &mut FrameCache, meta_dirty: &mut bool) ->
             buf.push_str("\"}");
         }
     }
+    // clock-mode-style, the active window's or the global one.
+    crate::clock_style::append_frame_json(app, buf);
     if let Some(pbs) = app.user_options.get("pane-border-status") {
         if buf.ends_with('}') {
             buf.pop();
@@ -264,6 +266,8 @@ pub(crate) fn dump_state(
 
 /// The push at the end of a loop iteration (copied), for one session.
 pub(crate) fn push(app: &mut AppState, lp: &mut SessionLoop) -> io::Result<()> {
+    // Unsolicited frames need the same live titles as explicit state queries.
+    helpers::propagate_osc_titles(app);
     if lp.state_dirty {
         crate::copy_mode::tick_auto_refresh(app);
     }

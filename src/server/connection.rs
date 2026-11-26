@@ -262,6 +262,23 @@ pub(crate) fn split_refusal(reply: &str) -> Option<&str> {
     reply.strip_prefix("psmux: ").filter(|m| m.starts_with("split-window: "))
 }
 
+/// The terminator a listing reply needs: one newline, unless the producer
+/// already ended its text with one. Some producers build their rows with a
+/// newline after each row and others join them, so a fixed `{}\n` printed a
+/// stray empty last line after list-panes, list-keys, show-options and more
+/// (tmux never prints one). An empty text still gets its newline: registry
+/// readers expect every reply to end in one (#809).
+pub(crate) fn listing_terminator(text: &str) -> &'static str {
+    if text.ends_with('\n') { "" } else { "\n" }
+}
+
+/// Write a listing reply ending in exactly one newline (see
+/// `listing_terminator`) and flush it.
+fn write_listing(write_stream: &mut ReplyStream, text: &str) {
+    let _ = write!(write_stream, "{}{}", text, listing_terminator(text));
+    let _ = write_stream.flush();
+}
+
 /// Write a split-window reply. A refusal on a one-shot connection is the
 /// command's error reply, `ERROR: split-window: <why>`, so the rest of a
 /// list does not run and the CLI exits 1 with it on stderr, as tmux stops a
@@ -677,7 +694,7 @@ fn bare_target_rewrite(
     let end = crate::cli::outer_target_scan_end(cmd, args).min(args.len());
     let Some(i) = args[..end].iter().position(|a| *a == "-t") else { return Ok(None) };
     let Some(t) = args.get(i + 1) else { return Ok(None) };
-    if !crate::cli::bare_target_token(t) {
+    if !crate::commands::target_resolved_in_server(kind, t) {
         return Ok(None);
     }
     let (s, r) = mpsc::channel();
@@ -1409,26 +1426,40 @@ fn requote_command_tail(args: &[&str]) -> String {
     crate::pane::requote_argv(args)
 }
 
-/// The positional `shell-command` operand of `respawn-pane` / `respawn-window`
-/// (tmux takes it plain, not behind `--`). Everything that is a flag, or the
-/// value of the one value-taking flag left in `args` (`-c`; `-t` is stripped
-/// upstream by `without_outer_target`), is skipped.
-fn respawn_positional_command(args: &[&str]) -> Option<String> {
-    let mut i = 0;
-    while i < args.len() {
-        let a = args[i];
-        if a == "-c" || a == "-e" || a == "-t" {
-            i += 2;
-            continue;
-        }
-        if a.starts_with('-') {
-            i += 1;
-            continue;
-        }
-        let s = a.trim_matches('"').trim().to_string();
-        return if s.is_empty() { None } else { Some(s) };
-    }
-    None
+/// `args` of new-window or split-window cut where getopt ends the options
+/// (cli::options_and_operand_start), and the pane command the operands make,
+/// as tmux's spawn reads them: one operand is a shell command string, two or
+/// more are an argv run directly (the `-- prog args...` form build_command
+/// execs). With or without `--` the same, so `split-window -d pwsh -NoProfile
+/// -Command x` runs all of its words (it ran a bare `pwsh`, #1051), and a
+/// word of the command such as `-d` or `-h` is never read as a flag.
+fn split_spawn_operands<'a>(cmd: &str, args: &'a [&'a str]) -> (&'a [&'a str], Option<String>) {
+    let (_, start) = crate::cli::options_and_operand_start(cmd, args);
+    let (options, operands) = args.split_at(start);
+    let command = if operands.len() > 1 {
+        Some(format!("-- {}", requote_command_tail(operands)))
+    } else {
+        operands.first().map(|s| s.trim_matches('"').to_string()).filter(|s| !s.is_empty())
+    };
+    (options, command)
+}
+
+/// `args` of respawn-pane or respawn-window cut where getopt ends the options,
+/// and the command the operands make (tmux takes it plain or behind `--`):
+/// two or more operands are an argv, as [`split_spawn_operands`] reads them,
+/// so none is dropped (#1051). One operand is a shell string, read as before:
+/// whole behind `--` (the `-- "<cmd>"` form Claude Code teammates send,
+/// #399), with stray outer quotes trimmed when plain (#580).
+fn respawn_operands<'a>(cmd: &str, args: &'a [&'a str]) -> (&'a [&'a str], Option<String>) {
+    let (_, start) = crate::cli::options_and_operand_start(cmd, args);
+    let (options, operands) = args.split_at(start);
+    let command = match operands {
+        [] => None,
+        [one] if options.last() == Some(&"--") => Some(one.trim().to_string()),
+        [one] => Some(one.trim_matches('"').trim().to_string()),
+        _ => Some(format!("-- {}", requote_command_tail(operands))),
+    };
+    (options, command.filter(|s| !s.is_empty()))
 }
 
 /// Every `-e KEY=VALUE` of a spawning command, in order. Like tmux's
@@ -2310,7 +2341,8 @@ fn relay_to_session(write_stream: &mut ReplyStream, port: u16, key: &str, line: 
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.write_all(format!("AUTH {}\n{}\n", key, line).as_bytes())?;
     stream.flush()?;
-    let _ = stream.shutdown(std::net::Shutdown::Write);
+    // No half-close: see NO CLIENT HALF-CLOSE in session.rs. The session
+    // server closes this connection once it has answered.
     let mut reply = Vec::new();
     let _ = io::Read::read_to_end(&mut stream, &mut reply);
     let text = String::from_utf8_lossy(&reply);
@@ -2736,7 +2768,7 @@ if control_echo || control_quiet || control_noecho {
     // before it (issue #857).
     {
         let mut ws = write_lock.lock().unwrap();
-        let init_ts = chrono::Utc::now().timestamp();
+        let init_ts = jiff::Timestamp::now().as_second();
         // One write: DCS opener (no newline) and the block together.
         let _ = ws.write_all(control::initial_reply_block(init_ts, control_noecho).as_bytes());
         let _ = ws.flush();
@@ -2841,7 +2873,7 @@ if control_echo || control_quiet || control_noecho {
             });
             if let Some(name) = unknown {
                 cmd_counter += 1;
-                let ts = chrono::Utc::now().timestamp();
+                let ts = jiff::Timestamp::now().as_second();
                 let mut out = String::new();
                 if control_echo {
                     out.push_str(stripped);
@@ -2870,7 +2902,7 @@ if control_echo || control_quiet || control_noecho {
         if trimmed.is_empty() { continue; }
 
         cmd_counter += 1;
-        let ts = chrono::Utc::now().timestamp();
+        let ts = jiff::Timestamp::now().as_second();
 
         // A send merged into the one before it: its keys went out with that
         // write, and it answers its own empty block like any send (#799).
@@ -3575,6 +3607,14 @@ loop {
     } else {
         effective_line = line.trim().to_string();
     }
+    // A persistent connection is an attached client's: its lines are what was
+    // typed at the command prompt or bound to a key, which tmux reads with its
+    // parser, so a user-keys value reads `\e` as ESC there as it does in a
+    // config file (#1014). The CLI's one-shot lines keep their arguments.
+    let effective_line = match persistent.then(|| crate::config::user_keys_line_tmux_read(&effective_line)).flatten() {
+        Some(read) => read,
+        None => effective_line,
+    };
     let mut parsed = crate::cli::normalize_command_words(parse_command_line(&effective_line), true);
     // `command-alias` (tmux cmd_parse_expand_alias): the alias's first command
     // runs here and the rest go ahead of whatever is already queued. The old
@@ -3647,8 +3687,8 @@ if persistent && client_readonly && !readonly_client_may_run(cmd) {
 // same treatment, as the command's own `-t`.
 let target_line_args: Vec<&str>;
 let probe_args: &[&str] = match global_raw_target.as_deref() {
-    Some(g) if crate::cli::bare_target_token(g)
-        && crate::commands::in_server_target_kind(cmd).is_some()
+    Some(g) if crate::commands::in_server_target_kind(cmd)
+            .is_some_and(|kind| crate::commands::target_resolved_in_server(kind, g))
         && !args[..crate::cli::outer_target_scan_end(cmd, &args).min(args.len())].contains(&"-t") =>
     {
         target_line_args = ["-t", g].into_iter().chain(args.iter().copied()).collect();
@@ -3727,6 +3767,14 @@ if set_option_command {
                 if pt.pane.is_some() {
                     target_pane = pt.pane;
                     pane_is_id = pt.pane_is_id;
+                }
+                // A bare `%N` names its window too: a window half left over
+                // from the TARGET line (`s:+` rewritten to `%4` above) must
+                // not be checked as a window called "+" (#1040).
+                if pt.pane_is_id && pt.window.is_none() {
+                    target_win = None;
+                    target_win_is_id = false;
+                    target_win_name = None;
                 }
             }
             i += 2; continue;
@@ -4002,6 +4050,10 @@ let targeted_tx = TargetedSender::new(&tx, command_target).in_file(source_job_fi
 let tx = &targeted_tx;
 match cmd {
     "new-window" | "neww" => {
+        // Flags are read from the options only (#1051); see below for the
+        // command the operands make.
+        let (args, cmd_str) = split_spawn_operands(cmd, &args);
+        let args = args.to_vec();
         let name: Option<String> = args.windows(2).find(|w| w[0] == "-n").map(|w| w[1].trim_matches('"').to_string());
         let start_dir: Option<String> = args.windows(2).find(|w| w[0] == "-c").map(|w| w[1].trim_matches('"').to_string());
         let detached = args.iter().any(|a| *a == "-d");
@@ -4016,24 +4068,10 @@ match cmd {
             .filter(|w| w[0] == "-e")
             .filter_map(|w| w[1].trim_matches('"').split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
             .collect();
-        // tmux parity (#582): `-- prog args...` is an explicit argv. A
-        // multi-token argv keeps the `--` marker plus token boundaries so
-        // build_command execs it directly (tmux execvp); a single token
-        // keeps string semantics. Without `--`, the historical single-token
-        // extraction applies (the CLI sends the string form as one quoted
-        // arg).
-        let cmd_str: Option<String> = if let Some(pos) = args.iter().position(|a| *a == "--") {
-            let tail = &args[pos + 1..];
-            if tail.len() > 1 {
-                Some(format!("-- {}", requote_command_tail(tail)))
-            } else {
-                tail.first().map(|s| s.trim_matches('"').to_string()).filter(|s| !s.is_empty())
-            }
-        } else {
-            args.iter()
-                .find(|a| !a.starts_with('-') && args.windows(2).all(|w| !(w[0] == "-n" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-c" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-F" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-T" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-e" && w[1] == **a)) && !args.iter().any(|f| f.starts_with("-F") && f.len() > 2 && &f[2..] == **a))
-                .map(|s| s.trim_matches('"').to_string())
-        };
+        // tmux parity (#582, #1051): the operands are the command. Several
+        // keep the `--` marker plus token boundaries so build_command execs
+        // them directly (tmux execvp); a single one keeps string semantics
+        // (the CLI sends the string form as one quoted arg).
         // -t (already peeled off into raw_target), -a, -b, -k and -S decide the
         // index; the server resolves them against its window list.
         let placement = crate::types::NewWindowPlacement::from_args(&args, raw_target.as_deref());
@@ -4061,6 +4099,10 @@ match cmd {
         }
     }
     "split-window" | "splitw" => {
+        // Flags are read from the options only, and every operand is the
+        // command (#1051, the same as new-window).
+        let (args, cmd_str) = split_spawn_operands(cmd, &args);
+        let args = args.to_vec();
         let kind = if args.iter().any(|a| *a == "-h") { LayoutKind::Horizontal } else { LayoutKind::Vertical };
         let detached = args.iter().any(|a| *a == "-d");
         let zoom_after_split = args.iter().any(|a| *a == "-Z");
@@ -4093,19 +4135,6 @@ match cmd {
             before: crate::cli::has_short_flag(&args, 'b'),
             full: crate::cli::has_short_flag(&args, 'f'),
             keep: split_keep(&args),
-        };
-        // tmux parity (#582): same `--` argv handling as new-window above.
-        let cmd_str: Option<String> = if let Some(pos) = args.iter().position(|a| *a == "--") {
-            let tail = &args[pos + 1..];
-            if tail.len() > 1 {
-                Some(format!("-- {}", requote_command_tail(tail)))
-            } else {
-                tail.first().map(|s| s.trim_matches('"').to_string()).filter(|s| !s.is_empty())
-            }
-        } else {
-            args.iter()
-                .find(|a| !a.starts_with('-') && args.windows(2).all(|w| !(w[0] == "-c" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-p" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-l" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-T" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-F" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-e" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-m" && w[1] == **a)))
-                .map(|s| s.trim_matches('"').to_string())
         };
         if print_info {
             let (rtx, rrx) = mpsc::channel::<String>();
@@ -4321,14 +4350,18 @@ match cmd {
         }
     }
     "pane-mouse" => {
-        // pane-mouse PANE_ID BUTTON COL ROW M|m
+        // pane-mouse PANE_ID BUTTON COL ROW M|m|R
+        // R is a press replayed for a gesture already pressed (#1031): it
+        // acts like M but is not counted as a click. A server that predates
+        // R reads it as a press, as before.
         if args.len() >= 5 {
             if let (Ok(pane_id), Ok(button), Ok(col), Ok(row)) = (
                 args[0].parse::<usize>(), args[1].parse::<u8>(),
                 args[2].parse::<i16>(), args[3].parse::<i16>()
             ) {
                 let press = args[4] != "m";
-                let _ = tx.send(CtrlReq::PaneMouse(client_id, pane_id, button, col, row, press));
+                let replay = args[4] == "R";
+                let _ = tx.send(CtrlReq::PaneMouse(client_id, pane_id, button, col, row, press, replay));
             }
         }
     }
@@ -4410,6 +4443,19 @@ match cmd {
             }
         }
     }
+    "pane-hwheel" => {
+        // pane-hwheel PANE_ID left|right COL ROW MODS (#1036): a horizontal
+        // wheel notch, tmux's MouseDown6Pane / MouseDown7Pane.
+        if args.len() >= 5 {
+            let right = match args[1] { "right" => Some(true), "left" => Some(false), _ => None };
+            if let (Ok(pane_id), Some(right), Ok(col), Ok(row)) = (
+                args[0].parse::<usize>(), right, args[2].parse::<i16>(), args[3].parse::<i16>()
+            ) {
+                let mods = args[4].parse::<u8>().unwrap_or(0);
+                let _ = tx.send(CtrlReq::PaneHWheel(client_id, pane_id, right, Some((col, row)), mods));
+            }
+        }
+    }
     "split-sizes" => {
         // split-sizes PATH SIZE1,SIZE2,...  (PATH is "_" for root, or dot-separated indices)
         if args.len() >= 2 {
@@ -4440,7 +4486,7 @@ match cmd {
                 if persistent {
                     let _ = tx.send(CtrlReq::ShowTextPopup("list-windows".to_string(), text));
                 } else {
-                    let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
+                    write_listing(&mut write_stream, &text);
                 }
             }
         } else if args.iter().any(|a| *a == "-J") {
@@ -4451,7 +4497,7 @@ match cmd {
                 if persistent {
                     let _ = tx.send(CtrlReq::ShowTextPopup("list-windows".to_string(), text));
                 } else {
-                    let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
+                    write_listing(&mut write_stream, &text);
                 }
             }
         } else {
@@ -4462,13 +4508,13 @@ match cmd {
                 if persistent {
                     let _ = tx.send(CtrlReq::ShowTextPopup("list-windows".to_string(), text));
                 } else {
-                    let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
+                    write_listing(&mut write_stream, &text);
                 }
             }
         }
         if !persistent && pending_chain.is_empty() { break; }
     }
-    "list-tree" => { let (rtx, rrx) = mpsc::channel::<String>(); let _ = tx.send(CtrlReq::ListTree(rtx)); if let Ok(text) = rrx.recv() { if persistent { let _ = tx.send(CtrlReq::ShowTextPopup("list-tree".to_string(), text)); } else { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); } } if !persistent && pending_chain.is_empty() { break; } }
+    "list-tree" => { let (rtx, rrx) = mpsc::channel::<String>(); let _ = tx.send(CtrlReq::ListTree(rtx)); if let Ok(text) = rrx.recv() { if persistent { let _ = tx.send(CtrlReq::ShowTextPopup("list-tree".to_string(), text)); } else { write_listing(&mut write_stream, &text); } } if !persistent && pending_chain.is_empty() { break; } }
     "window-layout" => {
         // Issue #257: return simplified layout JSON for a given window id.
         // Usage: window-layout <window_id>
@@ -4621,7 +4667,7 @@ match cmd {
             if persistent {
                 let _ = tx.send(CtrlReq::ShowTextPopup("list-panes".to_string(), text));
             } else {
-                let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
+                write_listing(&mut write_stream, &text);
             }
         }
         if !persistent && pending_chain.is_empty() { break; }
@@ -4771,6 +4817,12 @@ match cmd {
                 let _ = write_stream.flush();
             }
         }
+        // The claim is the CLI's only request on its connection, and the
+        // CLI no longer half-closes (NO CLIENT HALF-CLOSE in session.rs): end
+        // the connection with the reply rather than wait out the 10 ms
+        // batching read for a next line that never comes. This is the launch
+        // path, where those milliseconds show.
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "swap-pane" | "swapp" => {
         let detach = args.iter().any(|a| *a == "-d");
@@ -4886,8 +4938,9 @@ match cmd {
         if let Ok(text) = rrx.recv() {
             if persistent {
                 let _ = tx.send(CtrlReq::ShowTextPopup("list-buffers".to_string(), text));
-            } else {
-                let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
+            } else if !text.is_empty() {
+                // No buffers prints nothing, as in tmux, not an empty line.
+                write_listing(&mut write_stream, &text);
             }
         }
         if !persistent && pending_chain.is_empty() { break; }
@@ -4966,7 +5019,7 @@ match cmd {
             if persistent {
                 let _ = tx.send(CtrlReq::ShowTextPopup("choose-buffer".to_string(), text));
             } else {
-                let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
+                write_listing(&mut write_stream, &text);
             }
         }
         if !persistent && pending_chain.is_empty() { break; }
@@ -5159,36 +5212,18 @@ match cmd {
         }
     }
     "respawn-pane" | "respawnp" => {
+        // tmux: `respawn-pane [-k] [-c dir] [-t target] [shell-command]`.
+        // Every operand, after `--` (#399, #582) or plain (#580), is the
+        // command: one is a shell string (the Claude Code teammate form
+        // `-- "<cmd>"`), several an argv build_command execs directly. Only
+        // the first was kept without `--`, so `respawn-pane -k pwsh
+        // -NoProfile -Command x` ran a bare pwsh (#1051). Flags are read
+        // from the options only.
+        let (args, command) = respawn_operands(cmd, &args);
         let workdir = args.windows(2).find(|w| w[0] == "-c").map(|w| w[1].to_string());
         let empty = args.iter().any(|a| *a == "-E");
         // -E implies replacing the running pane, so it also kills it.
         let kill = args.iter().any(|a| *a == "-k") || empty;
-        // Honor `-- <shell-command>` (issue #399): Claude Code agent-teams
-        // delivers the teammate launch via `respawn-pane -k -t %N -- "<cmd>"`.
-        // Without this the pane is respawned with the default shell and the
-        // teammate never boots (mailbox stays unread, task never runs).
-        // tmux parity (#582): a multi-token argv after `--` keeps the marker
-        // and token boundaries so build_command execs it directly; the
-        // single-quoted-string teammate form keeps shell semantics.
-        let command = args.iter().position(|a| *a == "--")
-            .map(|i| {
-                let tail = &args[i + 1..];
-                if tail.len() > 1 {
-                    format!("-- {}", requote_command_tail(tail))
-                } else {
-                    tail.join(" ")
-                }
-            })
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            // tmux documents the command as a plain positional operand
-            // (`respawn-pane [-k] [-c dir] [-t target] [shell-command]`), not
-            // as a `--` tail. Without this the positional form was silently
-            // dropped and the pane came back as the default shell, which also
-            // left `#{pane_start_command}` unable to follow a respawn (#580).
-            // `-t` is already stripped by `without_outer_target`; `-c` is the
-            // only other flag here that takes a value.
-            .or_else(|| respawn_positional_command(&args));
         // Read the reply: every respawn failure is a routine command error
         // ("pane ... still active" without -k, a bad -c, an unspawnable
         // command). Fire-and-forget here meant the CLI exited 0 with empty
@@ -5577,7 +5612,7 @@ match cmd {
             } else if persistent {
                 let _ = tx.send(CtrlReq::ShowTextPopup("list-keys".to_string(), filtered));
             } else {
-                let _ = write!(write_stream, "{}\n", filtered); let _ = write_stream.flush();
+                write_listing(&mut write_stream, &filtered);
             }
         }
         if !persistent && pending_chain.is_empty() { break; }
@@ -6152,7 +6187,7 @@ match cmd {
                     } else if !text.is_empty() {
                         // A window that owns nothing prints NOTHING, not the
                         // blank line a bare `{}\n` would emit (#655).
-                        let _ = write!(write_stream, "{}\n", text);
+                        write_listing(&mut write_stream, &text);
                         let _ = write_stream.flush();
                     }
                 }
@@ -6170,7 +6205,7 @@ match cmd {
                     if persistent {
                         let _ = tx.send(CtrlReq::ShowTextPopup("show-options".to_string(), text));
                     } else {
-                        let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
+                        write_listing(&mut write_stream, &text);
                     }
                 }
             }
@@ -6319,7 +6354,7 @@ match cmd {
             if persistent {
                 let _ = tx.send(CtrlReq::ShowTextPopup("find-window".to_string(), text));
             } else {
-                let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
+                write_listing(&mut write_stream, &text);
             }
         }
         if !persistent && pending_chain.is_empty() { break; }
@@ -6570,12 +6605,13 @@ match cmd {
     }
     "show-hooks" => {
         let (rtx, rrx) = mpsc::channel::<String>();
-        let _ = tx.send(CtrlReq::ShowHooks(rtx));
+        let _ = tx.send(CtrlReq::ShowHooks(args.iter().map(|a| a.to_string()).collect(), rtx));
         if let Ok(text) = rrx.recv() {
             if persistent {
                 let _ = tx.send(CtrlReq::ShowTextPopup("show-hooks".to_string(), text));
-            } else {
-                let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
+            } else if !text.is_empty() {
+                // Nothing to show prints nothing, as in tmux.
+                write_listing(&mut write_stream, &text);
             }
         }
         if !persistent && pending_chain.is_empty() { break; }
@@ -7069,7 +7105,7 @@ match cmd {
                 if persistent {
                     let _ = tx.send(CtrlReq::ShowTextPopup("list-sessions".to_string(), text));
                 } else {
-                    let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
+                    write_listing(&mut write_stream, &text);
                 }
             }
         } else {
@@ -7079,7 +7115,7 @@ match cmd {
                 if persistent {
                     let _ = tx.send(CtrlReq::ShowTextPopup("list-sessions".to_string(), text));
                 } else {
-                    let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
+                    write_listing(&mut write_stream, &text);
                 }
             }
         }
@@ -7312,12 +7348,20 @@ match cmd {
         }
     }
     "list-commands" | "lscm" => {
-        let cmds = TMUX_COMMANDS.join("\n");
-        if persistent {
+        let (rtx, rrx) = mpsc::channel::<String>();
+        let _ = tx.send(CtrlReq::ListCommands(args.iter().map(|a| a.to_string()).collect(), rtx));
+        let cmds = rrx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+        if let Some(msg) = cmds.strip_prefix("ERROR: ") {
+            if persistent {
+                let _ = tx.send(CtrlReq::StatusMessage(msg.to_string()));
+            } else {
+                let _ = writeln!(write_stream, "ERROR: {}", msg);
+                let _ = write_stream.flush();
+            }
+        } else if persistent {
             let _ = tx.send(CtrlReq::ShowTextPopup("list-commands".to_string(), cmds));
-        } else {
-            let _ = write!(write_stream, "{}\n", cmds);
-            let _ = write_stream.flush();
+        } else if !cmds.is_empty() {
+            write_listing(&mut write_stream, &cmds);
         }
         if !persistent && pending_chain.is_empty() { break; }
     }
@@ -7331,7 +7375,7 @@ match cmd {
             if persistent {
                 let _ = tx.send(CtrlReq::ShowTextPopup("show-messages".to_string(), text));
             } else {
-                let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
+                write_listing(&mut write_stream, &text);
             }
         }
         if !persistent && pending_chain.is_empty() { break; }
@@ -7383,23 +7427,15 @@ match cmd {
         // tmux: `respawn-window [-k] [-c dir] [-t target] [shell-command]`.
         // The command operand follows the same rule as respawn-pane, so a
         // respawn-window that carries one also replaces the pane's recorded
-        // `#{pane_start_command}` (#580).
-        let command = args.iter().position(|a| *a == "--")
-            .map(|i| {
-                let tail = &args[i + 1..];
-                if tail.len() > 1 {
-                    format!("-- {}", requote_command_tail(tail))
-                } else {
-                    tail.join(" ")
-                }
-            })
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .or_else(|| respawn_positional_command(&args));
+        // `#{pane_start_command}` (#580), and every operand is kept (#1051).
+        let (args, command) = respawn_operands(cmd, &args);
         let workdir = args.windows(2).find(|w| w[0] == "-c").map(|w| w[1].to_string());
+        // Without -k a window with a live pane is refused (tmux spawn.c);
+        // the server always killed it, -k or not.
+        let kill = args.iter().any(|a| *a == "-k");
         let (resp_s, resp_r) = mpsc::channel();
         let env_sets = env_flag_values(&args);
-        let _ = tx.send(CtrlReq::RespawnWindow(workdir, command, resp_s, env_sets));
+        let _ = tx.send(CtrlReq::RespawnWindow(workdir, kill, command, resp_s, env_sets));
         if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
             let _ = writeln!(write_stream, "ERROR: {}", e);
             let _ = write_stream.flush();
@@ -7733,6 +7769,9 @@ fn dispatch_control_command(
             true
         }
         "new-window" | "neww" => {
+            // Flags from the options only; every operand is the command
+            // (#1051): `new-window pwsh -NoProfile` ran a bare `pwsh`.
+            let (args, cmd_str) = split_spawn_operands(cmd, args);
             let name = args.windows(2).find(|w| w[0] == "-n").map(|w| w[1].trim_matches('"').to_string());
             let start_dir = args.windows(2).find(|w| w[0] == "-c").map(|w| w[1].trim_matches('"').to_string());
             let detached = crate::cli::has_short_flag(&args, 'd');
@@ -7740,27 +7779,6 @@ fn dispatch_control_command(
             let format_str = extract_flag_value(&args, "-F").map(|s| s.trim_matches('"').to_string());
             let title = extract_flag_value(&args, "-T").map(|s| s.trim_matches('"').to_string());
             let empty = args.iter().any(|a| *a == "-E");
-            // Skip arg if it's a flag, the value of a flag, or a flag-cluster
-            // value (e.g. the format string after `-PF`).
-            let mut skip: std::collections::HashSet<usize> = std::collections::HashSet::new();
-            for (i, a) in args.iter().enumerate() {
-                if a.starts_with('-') && !a.starts_with("--") {
-                    skip.insert(i);
-                    // Two-token forms: next arg is the value
-                    if matches!(*a, "-n" | "-c" | "-F" | "-t" | "-x" | "-y" | "-e" | "-T") {
-                        skip.insert(i + 1);
-                    } else if a.len() > 2
-                        && a.chars().skip(1).all(|c| c.is_ascii_alphabetic())
-                        && matches!(a.chars().last(), Some('n') | Some('c') | Some('F') | Some('t') | Some('x') | Some('y') | Some('e') | Some('T'))
-                    {
-                        // Cluster ending in value-taking flag: -PF <value>
-                        skip.insert(i + 1);
-                    }
-                }
-            }
-            let cmd_str: Option<String> = args.iter().enumerate()
-                .find(|(i, _)| !skip.contains(i))
-                .map(|(_, s)| s.trim_matches('"').to_string());
             // -e KEY=VALUE environment for the new pane (tmux parity, #489).
             let env_sets: Vec<(String, String)> = args.windows(2)
                 .filter(|w| w[0] == "-e")
@@ -7789,12 +7807,14 @@ fn dispatch_control_command(
             }
         }
         "split-window" | "splitw" => {
+            // The operands are the command; this route dropped them all and
+            // split with the default shell (#1051).
+            let (args, cmd_str) = split_spawn_operands(cmd, args);
             let kind = if crate::cli::has_short_flag(&args, 'h') {
                 LayoutKind::Horizontal
             } else {
                 LayoutKind::Vertical
             };
-            let cmd_str = args.windows(2).find(|w| w[0] == "-c").map(|_| ()).and(None);
             let start_dir = args.windows(2).find(|w| w[0] == "-c").map(|w| w[1].trim_matches('"').to_string());
             let detached = crate::cli::has_short_flag(&args, 'd');
             let zoom_after_split = crate::cli::has_short_flag(&args, 'Z');
@@ -8803,7 +8823,7 @@ fn dispatch_control_command(
         }
         "show-hooks" => {
             let (rtx, rrx) = mpsc::channel::<String>();
-            let _ = tx.send(CtrlReq::ShowHooks(rtx));
+            let _ = tx.send(CtrlReq::ShowHooks(args.iter().map(|a| a.to_string()).collect(), rtx));
             if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
                 let _ = resp_tx.send(text);
             }
@@ -8819,7 +8839,7 @@ fn dispatch_control_command(
         }
         "list-commands" | "lscm" => {
             let (rtx, rrx) = mpsc::channel::<String>();
-            let _ = tx.send(CtrlReq::ListCommands(rtx));
+            let _ = tx.send(CtrlReq::ListCommands(args.iter().map(|a| a.to_string()).collect(), rtx));
             if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
                 let _ = resp_tx.send(text);
             }
@@ -8903,19 +8923,32 @@ fn dispatch_control_command(
             true
         }
         "respawn-pane" | "respawnp" => {
+            // Every operand is the command, with or without `--` (#399,
+            // #1051); this route ignored a command without `--`.
+            let (args, command) = respawn_operands(cmd, args);
             let workdir = args.windows(2).find(|w| w[0] == "-c").map(|w| w[1].to_string());
             let empty = args.iter().any(|a| *a == "-E");
             let kill = args.iter().any(|a| *a == "-k") || empty;
-            // Honor `-- <shell-command>` (issue #399): teammate launch delivery.
-            let command = args.iter().position(|a| *a == "--")
-                .map(|i| args[i + 1..].join(" "))
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
             // Control mode: a refused respawn must come back as %error, not as
             // a successful %end (the refusal used to kill the server outright).
             let (resp_s, resp_r) = mpsc::channel();
             let env_sets = env_flag_values(&args);
             let _ = tx.send(CtrlReq::RespawnPane(workdir, kill, command, empty, resp_s, env_sets));
+            match resp_r.recv_timeout(Duration::from_secs(5)) {
+                Ok(Err(e)) => { let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", e)); }
+                _ => { let _ = resp_tx.send(String::new()); }
+            }
+            true
+        }
+        "respawn-window" | "respawnw" => {
+            // Was "unknown command" in control mode (#1051 follow up). The
+            // same operands and reply as respawn-pane above.
+            let (args, command) = respawn_operands(cmd, args);
+            let workdir = args.windows(2).find(|w| w[0] == "-c").map(|w| w[1].to_string());
+            let kill = args.iter().any(|a| *a == "-k");
+            let (resp_s, resp_r) = mpsc::channel();
+            let env_sets = env_flag_values(&args);
+            let _ = tx.send(CtrlReq::RespawnWindow(workdir, kill, command, resp_s, env_sets));
             match resp_r.recv_timeout(Duration::from_secs(5)) {
                 Ok(Err(e)) => { let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", e)); }
                 _ => { let _ = resp_tx.send(String::new()); }
@@ -9460,3 +9493,11 @@ mod tests_resize_pane_both_axes;
 #[cfg(test)]
 #[path = "../../tests-rs/test_set_option_forward_line.rs"]
 mod tests_set_option_forward_line;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_list_trailing_newline.rs"]
+mod tests_list_trailing_newline;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue1051_spawn_operands.rs"]
+mod tests_issue1051_spawn_operands;

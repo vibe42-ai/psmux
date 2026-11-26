@@ -622,6 +622,9 @@ const OPTIONS_REF: &[(&str, &str)] = &[
     ("program-status",             "off"),
     ("remain-on-exit",             "off"),
     ("remain-on-exit-format",      "Pane is dead (...)"),
+    ("scroll-on-clear",            "on"),
+    ("cursor-colour",              "(none)"),
+    ("clock-mode-style",           "24-with-seconds"),
     ("renumber-windows",           "off"),
     ("aggressive-resize",          "off"),
     ("automatic-rename",           "on"),
@@ -683,6 +686,7 @@ const OPTIONS_REF: &[(&str, &str)] = &[
     ("codepoint-widths",           "\"\""),
     ("terminal-overrides",         "linux*:AX@"),
     ("set-clipboard",              "external"),
+    ("get-clipboard",              "buffer"),
     ("set-titles-string",          "\"\""),
     // psmux extensions
     ("cursor-style",               "default"),

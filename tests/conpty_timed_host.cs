@@ -38,6 +38,7 @@ class ConptyTimedHost
     static double Now() { long ft; GetSystemTimePreciseAsFileTime(out ft); return (ft - 116444736000000000L) / 10000.0; }
     static byte[] Hex(string h) { var b = new byte[h.Length / 2]; for (int i = 0; i < b.Length; i++) b[i] = Convert.ToByte(h.Substring(i * 2, 2), 16); return b; }
 
+    [DllImport("kernel32.dll")] static extern bool SetStdHandle(int n, IntPtr h);
     static void Main(string[] args)
     {
         timeBeginPeriod(1);
@@ -53,6 +54,10 @@ class ConptyTimedHost
         IntPtr al = Marshal.AllocHGlobal(ls); InitializeProcThreadAttributeList(al, 1, 0, ref ls);
         UpdateProcThreadAttribute(al, 0, (IntPtr)0x00020016, pc, (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero);
         var si = new STARTUPINFOEX(); si.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFOEX)); si.lpAttributeList = al;
+        // Bind fresh standard handles to ConPTY when the runner redirects I/O.
+        SetStdHandle(-10, IntPtr.Zero);
+        SetStdHandle(-11, IntPtr.Zero);
+        SetStdHandle(-12, IntPtr.Zero);
         PROCESS_INFORMATION pi;
         if (!CreateProcess(null, cmdline, IntPtr.Zero, IntPtr.Zero, false, 0x00080000, IntPtr.Zero, null, ref si, out pi))
         { File.WriteAllText(log, "CreateProcess failed " + Marshal.GetLastWin32Error()); Environment.Exit(2); }
@@ -67,7 +72,15 @@ class ConptyTimedHost
             string line = raw.TrimEnd();
             if (line.Length == 0 || line.StartsWith("#")) continue;
             var p = line.Split(new[] { ' ' }, 3);
-            if (p[0] == "S") { Thread.Sleep(int.Parse(p[1])); continue; }
+            if (p[0] == "S") {
+                // A short wait spins on the clock: Thread.Sleep(4), even with
+                // timeBeginPeriod(1), came back after 4 to 21 ms on a loaded
+                // machine, and #841's split Down needs [B inside escape-time.
+                int ms = int.Parse(p[1]);
+                if (ms <= 20) { var sw = System.Diagnostics.Stopwatch.StartNew(); while (sw.Elapsed.TotalMilliseconds < ms) Thread.SpinWait(50); }
+                else Thread.Sleep(ms);
+                continue;
+            }
             if (p[0] == "X") {
                 var psi = new System.Diagnostics.ProcessStartInfo("cmd.exe", "/c " + p[2]);
                 psi.UseShellExecute = false; psi.RedirectStandardOutput = true; psi.CreateNoWindow = true;
@@ -78,8 +91,11 @@ class ConptyTimedHost
             byte[] data = p[0] == "H" ? Hex(p[2]) : System.Text.Encoding.UTF8.GetBytes(p[2]);
             double t = Now();
             WriteFile(inW, data, data.Length, out w, IntPtr.Zero);
+            // No log write here: rewriting the whole log after each write
+            // put file I/O between two timed writes (#841 asks for ESC and
+            // [B 4 ms apart and got 11.3 ms under the full runner). The next
+            // X line and the end write it.
             lines.Add(string.Format("{0:F3} {1}", t, p[1]));
-            File.WriteAllLines(log, lines);
         }
         Thread.Sleep(500);
         File.WriteAllLines(log, lines);

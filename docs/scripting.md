@@ -402,6 +402,9 @@ not part of it. Capture again after any split you want to keep.
 | `#{pane_current_command}` | Foreground process name |
 | `#{pane_current_path}` | Current working directory of the pane. Under `wsl` or `ssh` this needs shell integration, see [the FAQ](faq.md) |
 | `#{pane_path}` | Path the pane announced over `OSC 7` or `OSC 9;9`, untranslated, empty if none |
+| `#{pane_tabs}` | The pane's tab stops, comma separated, every 8 columns unless the program set its own (see [Tab Stops](compatibility.md#tab-stops-hts-tbc-cbt-hpa)) |
+| `#{pane_pb_state}` | Progress indicator state the pane set with `OSC 9;4`: `hidden`, `normal`, `error`, `indeterminate` or `paused`. `hidden` if it set none |
+| `#{pane_pb_progress}` | Progress indicator percentage the pane set with `OSC 9;4`, `0` if it set none |
 | `#{pane_start_command}` | Command the pane was started with, **empty** when it was started with the default shell. A `--` argv is reported as its token list, a single command string is quoted when it contains spaces (tmux `args_escape`). A respawn replaces it only when the respawn carried a command of its own |
 | `#{pane_pid}` | PID of the pane's shell |
 | `#{pane_tty}` | Pseudo terminal name, for example `/dev/pty1` |
@@ -429,6 +432,7 @@ bind-key -n C-h if-shell -F "#{pane_at_left}" "send-keys C-h" "select-pane -L"
 |----------|-------------|
 | `#{cursor_x}` / `#{cursor_y}` | Cursor position in the active pane, zero based |
 | `#{cursor_character}` | Character under the cursor |
+| `#{cursor_colour}` | Cursor colour of the pane: the one its program set with `ESC ] 12` as `#rrggbb`, then `cursor-colour` by its colour name, then `none` |
 | `#{mouse_x}` / `#{mouse_y}` | Where the mouse event of the running binding happened: the cell in its pane, or the column and status line for a status line event; empty outside a mouse binding |
 | `#{mouse_line}` | Full line under the mouse event, in the pane it happened in |
 | `#{mouse_word}` | Word under the mouse event, in the pane it happened in |
@@ -442,7 +446,8 @@ bind-key -n C-h if-shell -F "#{pane_at_left}" "send-keys C-h" "select-pane -L"
 | `#{search_present}` | `1` if a copy mode search is active |
 | `#{search_match}` | The current search match |
 | `#{scroll_position}` | Lines scrolled back from the live bottom |
-| `#{scroll_region_upper}` / `#{scroll_region_lower}` | Upper and lower bound of the pane's scroll region (DECSTBM), 0 based |
+| `#{scroll_region_upper}` / `#{scroll_region_lower}` | Top and bottom rows of the pane's scroll region, counted from 0. The whole pane until a program sets one with `ESC [ top ; bottom r` (see [Scroll Region](compatibility.md#scroll-region-origin-mode-and-decaln)) |
+| `#{origin_flag}` | `1` while the pane is in origin mode (`ESC [ ? 6 h`) |
 
 ### Buffer variables
 
@@ -474,9 +479,9 @@ client attached, the identity variables (`client_name`, `client_pid`, `client_re
 | `#{client_activity}` / `#{client_created}` | Timestamps for the client |
 | `#{client_activity_string}` / `#{client_created_string}` | The same, already formatted |
 | `#{client_termname}` / `#{client_termtype}` | Terminal type reported by the client |
-| `#{client_termfeatures}` | Comma-separated terminal features reported at attach for the selected client; empty with no client |
+| `#{client_termfeatures}` | Comma-separated terminal features reported at attach for the selected client, and `progressbar` when `terminal-features` gives it that; empty with no client |
 
-Feature reporting covers these terminal profiles:
+Feature reporting covers these terminal profiles. `progressbar` is not part of a report: the server reads it from `terminal-features` against the `TERM` the client attached with, so with the default option each list below ends in `,progressbar`:
 
 | Terminal | Features |
 |---|---|
@@ -511,12 +516,13 @@ All other environments retain `256,RGB,hyperlinks,title` as a compatibility assu
 capability support. Clients that send no valid report receive the independently owned four-bit server
 fallback. Detection uses the attaching client's environment and passive local console observations at each
 attachment, including reconnection. It does not probe the terminal. The `terminal-features` option is kept
-as an array, as tmux keeps it, but nothing reads it, and feature-based output gating is not implemented;
-OSC 8 forwarding is unchanged.
+as an array, as tmux keeps it. Only its `progressbar` feature is read, which decides whether the client
+writes the progress indicator (see [Progress Indicator](compatibility.md#progress-indicator-osc-94));
+feature-based output gating is not implemented for the others, and OSC 8 forwarding is unchanged.
 
 The optional attach argument is `features=0x<hex digits>`, an unsigned 64-bit mask. Leading zeroes
 are optional. Bits 0, 1, 2, and 3 represent `256`, `RGB`, `hyperlinks`, and `title`, respectively.
-Unknown bits are retained, but only known feature names appear in `client_termfeatures`.
+Unknown bits are retained, but only known feature names appear in `client_termfeatures`. Bit 4 is `progressbar`, which a report does not set; the server decides it.
 Malformed or overflowing reports are ignored without rejecting the attachment; a zero mask is valid
 and produces an empty feature list.
 
@@ -541,7 +547,6 @@ and produces an empty feature list.
 | `#{mouse_all_flag}` | `1` if the pane enabled any event tracking, DECSET 1003 |
 | `#{mouse_utf8_flag}` | `1` if the pane enabled UTF-8 mouse reporting, DECSET 1005 |
 | `#{mouse_sgr_flag}` | `1` if the pane enabled SGR mouse reporting, DECSET 1006 |
-| `#{origin_flag}` | `1` if the pane enabled origin mode, DECSET 6 |
 | `#{insert_flag}` | `1` if the pane enabled insert mode, `CSI 4 h` (the mode is reported; text is still written in replace mode) |
 | `#{wrap_flag}` | `1` unless the pane turned autowrap off, DECRST 7 (the mode is reported; text still wraps) |
 | `#{keypad_cursor_flag}` | `1` if the pane enabled application cursor keys, DECSET 1 |
@@ -582,7 +587,7 @@ rather than live state. They exist for tmux format compatibility. Do not build l
 | `#{window_cell_width}` / `#{window_cell_height}` | `8` / `16` |
 | `#{window_linked_sessions_list}` | empty |
 | `#{pane_dead_signal}` / `#{pane_dead_status}` / `#{pane_dead_time}` | `0` |
-| `#{pane_start_path}` / `#{pane_tabs}` | empty |
+| `#{pane_start_path}` | empty |
 | `#{cursor_flag}` | `0` |
 | `#{client_utf8}` | `1` |
 | `#{client_cell_width}` / `#{client_cell_height}` | a fixed value |
@@ -706,8 +711,10 @@ Treat both as unavailable rather than as documented behaviour.
 ## Advanced Commands
 
 ```powershell
-# Discover supported commands
+# Discover supported commands (tmux's rows: name (alias) usage)
 psmux list-commands
+psmux list-commands split-window               # one command, by name, alias or prefix
+psmux list-commands -F '#{command_list_name}'  # names only
 
 # Server/session management
 psmux kill-server
@@ -785,7 +792,7 @@ psmux set-hook -g session-created "set -g status-left '[#S] ' \; display-message
 | `set-hook -ga <name> <command>` | The same, written globally. `-ag` is also accepted |
 | `set-hook -u <name>` | Unset, removing every handler for `<name>` |
 | `set-hook -gu <name>` | The same, globally. `-ug` is also accepted |
-| `show-hooks` | Print every registered hook and its handlers |
+| `show-hooks [-gpw] [hook]` | Print hooks and their handlers, as tmux does (see below) |
 
 The plain (non append) form **replaces**, so re-running a config cannot stack handlers on a hook
 you set with `set-hook`. Appends are **deduplicated**: appending a command that is already
@@ -797,31 +804,52 @@ psmux set-hook -ga after-new-window "display-message one"
 psmux set-hook -ga after-new-window "display-message one"   # ignored, identical
 psmux set-hook -ga after-new-window "display-message two"
 psmux show-hooks
-# after-new-window[0] -> display-message one
-# after-new-window[1] -> display-message two
+# after-new-window[0] display-message one
+# after-new-window[1] display-message two
 ```
 
-`show-hooks` prints `name -> command` when a hook has a single handler and `name[N] -> command`
-when it has several.
+### show-hooks output
 
-### Warning: hook names are not validated
+`show-hooks` prints what tmux 3.8 prints. Hooks are array options there, so every handler is one
+row `name[N] command`, indexed even when there is only one. Which hooks are listed depends on the
+scope, as in tmux:
 
-`set-hook` stores **any** name you give it. A misspelled hook is accepted silently, appears in
-`show-hooks`, and then simply never fires:
+| Form | Lists |
+|------|-------|
+| `show-hooks` | The session hooks that are set. Nothing at all when none is |
+| `show-hooks -g` | Every session hook in tmux's table order: set ones as `name[N] command` rows, empty ones as the bare name |
+| `show-hooks -w` / `-p` | The window and pane hooks that are set (`-p`: the pane hooks only) |
+| `show-hooks -gw` | Every window and pane hook (`pane-exited`, `pane-died`, `window-renamed`, ...), bare names for empty ones |
+| `show-hooks [-g] <hook>` | That hook's rows. Under `-g` an empty hook prints its bare name. `<hook>[N]` prints one row |
+
+Pane and window hooks such as `pane-died` and `pane-exited` are window options in tmux, so they
+are listed by `-w` / `-gw`, not by `-g`. After `set-hook -gu <name>` the hook is empty, so
+`show-hooks -g` still prints its bare name: check for `name[` to see whether a handler is set.
 
 ```powershell
-psmux set-hook -g after-new-windwo "display-message oops"   # accepted, never fires
-psmux show-hooks
-# after-new-windwo -> display-message oops
+psmux set-hook -g pane-exited "display-message bye"
+psmux show-hooks -gw | Select-String pane-exited
+# pane-exited[0] display-message bye
+psmux show-hooks -g session-created
+# session-created
 ```
 
-There is no error and no warning. After adding a hook, run `show-hooks` and check the name
-against the table below before assuming the hook is broken for some other reason.
+### Hook names are validated
+
+`set-hook` and `show-hooks` refuse a name that is no hook (or option), as tmux does:
+
+```powershell
+psmux set-hook -g after-new-windwo "display-message oops"
+# psmux: invalid option: after-new-windwo   (exit 1)
+```
+
+A name tmux knows but psmux does not fire yet is accepted. Check the table below for the hooks
+psmux fires.
 
 ### Available Hook Events
 
-Every hook below is fired by psmux. Names not in this table are accepted by `set-hook` but never
-fire.
+Every hook below is fired by psmux. Other tmux hook names are accepted by `set-hook` but never
+fire; a name that is no hook at all is refused.
 
 | Hook | Fires when... |
 |------|---------------|

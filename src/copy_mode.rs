@@ -489,6 +489,34 @@ pub fn retarget_mode_to_active_pane(app: &mut AppState, prev: Option<usize>) {
     sync_copy_prompt_status(app, had_prompt);
 }
 
+/// Remove windows (or panes) with `remove_fn` and hand the mode over to the
+/// pane that has the focus after it, as [`retarget_mode_to_active_pane`]
+/// does for a killed pane. In tmux a mode belongs to its `window_pane`, so a
+/// window going away takes its own mode with it and the pane that gets the
+/// focus keeps its own: closing a window used to leave the closed pane's
+/// clock or copy mode on the next one, and the next one's parked clock
+/// drawn over a pane that had no mode.
+pub fn remove_keeping_modes<R, F: FnOnce(&mut AppState) -> R>(app: &mut AppState, remove_fn: F) -> R {
+    let prev = active_pane_id(app);
+    let out = remove_fn(app);
+    forget_dead_clocks(app);
+    if !app.windows.is_empty() {
+        retarget_mode_to_active_pane(app, prev);
+    }
+    out
+}
+
+/// Drop the parked clocks of panes that no longer exist.
+pub(crate) fn forget_dead_clocks(app: &mut AppState) {
+    if app.clock_panes.is_empty() {
+        return;
+    }
+    let live: Vec<usize> = app.clock_panes.iter().copied()
+        .filter(|&p| crate::tree::find_pane_by_id_global(app, p).is_some())
+        .collect();
+    app.clock_panes = live;
+}
+
 /// Move the focus for one -t request without moving the focused pane's mode
 /// with it (#828).  `switch_fn` changes the active pane; the pane that loses
 /// focus keeps its own copy or clock mode parked, and the pane that gains it
@@ -530,12 +558,36 @@ pub fn switch_focus_keeping_modes<F: FnOnce(&mut AppState)>(app: &mut AppState, 
 fn park_clock(app: &mut AppState, prev: Option<usize>) {
     if matches!(app.mode, Mode::ClockMode) {
         if let Some(id) = prev {
-            if !app.clock_panes.contains(&id) {
+            // A pane killed with its clock parked leaves its id behind; drop
+            // those here, so the list never outgrows the panes that exist.
+            forget_dead_clocks(app);
+            // A pane that is gone takes its clock with it.
+            if !app.clock_panes.contains(&id) && crate::tree::find_pane_by_id_global(app, id).is_some() {
                 app.clock_panes.push(id);
             }
         }
         app.mode = Mode::Passthrough;
     }
+}
+
+/// Whether pane `id` is in clock mode, as the focused pane or a parked one.
+pub fn has_clock(app: &AppState, id: usize) -> bool {
+    (matches!(app.mode, Mode::ClockMode) && active_pane_id(app) == Some(id))
+        || app.clock_panes.contains(&id)
+}
+
+/// Close pane `id`'s clock, the focused pane's (`app.mode`) or a parked one.
+/// Returns whether the pane had a clock.
+pub fn close_clock_of(app: &mut AppState, id: usize) -> bool {
+    if matches!(app.mode, Mode::ClockMode) && active_pane_id(app) == Some(id) {
+        app.mode = Mode::Passthrough;
+        return true;
+    }
+    if let Some(i) = app.clock_panes.iter().position(|&p| p == id) {
+        app.clock_panes.swap_remove(i);
+        return true;
+    }
+    false
 }
 
 /// The focused pane takes back a clock mode it had parked.
@@ -1479,7 +1531,12 @@ pub fn paste_latest(app: &mut AppState) -> io::Result<()> {
     // stack is empty, so prefix+] pastes externally-copied text.
     let internal = app.paste_top().unwrap_or_default().to_string();
     let text = if internal.is_empty() {
-        crate::clipboard::read_from_system_clipboard().unwrap_or_default()
+        // A clipboard another window holds open is read off the server loop;
+        // the paste lands when it is free (commands::PendingClipboardPaste).
+        match crate::commands::clipboard_text_or_wait(app, crate::commands::ClipboardPasteDelivery::Raw) {
+            Some(text) => text,
+            None => return Ok(()),
+        }
     } else {
         internal
     };
@@ -2250,6 +2307,15 @@ pub fn prompt_edit(
         }
         "up" | "c-p" => PromptEdit::HistoryUp,
         "down" | "c-n" => PromptEdit::HistoryDown,
+        // The vi command mode word motions (status-keys vi): w and W to the
+        // start of the next word, e and E to the end of this one, B to the
+        // start of the word before. The capital ones split on spaces only
+        // (prompt.c:1392 to :1407 at tag 3.8).
+        "vi-w" => { b = len - prompt_forward_word_vi(&chars, idx, separators); PromptEdit::Edited }
+        "vi-bigw" => { b = len - prompt_forward_word_vi(&chars, idx, ""); PromptEdit::Edited }
+        "vi-e" => { b = len - prompt_end_word(&chars, idx, separators); PromptEdit::Edited }
+        "vi-bige" => { b = len - prompt_end_word(&chars, idx, ""); PromptEdit::Edited }
+        "vi-bigb" => { b = len - prompt_backward_word(&chars, idx, ""); PromptEdit::Edited }
         _ => PromptEdit::Other,
     };
     *input = chars.into_iter().collect();
@@ -2289,6 +2355,60 @@ fn prompt_forward_word(chars: &[char], idx: usize, separators: &str) -> usize {
             return idx;
         }
     }
+}
+
+/// Where vi's w goes from character index `idx`: to the end of the word as
+/// M-f does, then on over the spaces to the start of the next word
+/// (prompt_forward_word with vi set, prompt.c:1066 to :1104 at tag 3.8).
+fn prompt_forward_word_vi(chars: &[char], idx: usize, separators: &str) -> usize {
+    let size = chars.len();
+    let mut idx = idx.min(size);
+    if idx == size {
+        return idx;
+    }
+    let word_is_separators = prompt_in_list(separators, chars[idx]) && !prompt_space(chars[idx]);
+    loop {
+        idx += 1;
+        if idx == size {
+            return idx;
+        }
+        if prompt_space(chars[idx]) {
+            while idx != size && prompt_space(chars[idx]) {
+                idx += 1;
+            }
+            return idx;
+        }
+        if word_is_separators != prompt_in_list(separators, chars[idx]) {
+            return idx;
+        }
+    }
+}
+
+/// Where vi's e goes from character index `idx`: the last character of the
+/// next word end after the cursor (prompt_end_word, prompt.c:1108 to :1140).
+fn prompt_end_word(chars: &[char], idx: usize, separators: &str) -> usize {
+    let size = chars.len();
+    let mut idx = idx.min(size);
+    if idx == size {
+        return idx;
+    }
+    loop {
+        idx += 1;
+        if idx == size {
+            return idx;
+        }
+        if !prompt_space(chars[idx]) {
+            break;
+        }
+    }
+    let word_is_separators = prompt_in_list(separators, chars[idx]);
+    loop {
+        idx += 1;
+        if idx == size || prompt_space(chars[idx]) || word_is_separators != prompt_in_list(separators, chars[idx]) {
+            break;
+        }
+    }
+    idx - 1
 }
 
 /// Where M-b, and the start of what C-w cuts, is from character index `idx`:
@@ -3362,3 +3482,7 @@ mod test_issue866_prompt_word_keys;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue862_copy_word_motion.rs"]
 mod test_issue862_copy_word_motion;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_window_close_modes.rs"]
+mod test_window_close_modes;

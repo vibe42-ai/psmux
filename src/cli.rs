@@ -488,7 +488,8 @@ pub fn parse_display_message_args<S: AsRef<str>>(args: &[S]) -> Result<DisplayMe
 
 /// The format variables `display-message -a` lists, sorted like tmux's: the
 /// names tmux 3.4 prints for `display -p -a` (measured) that psmux's format
-/// expander also knows. Each is printed as `name=value`.
+/// expander also knows, and `pane_pb_progress` and `pane_pb_state`, which
+/// tmux 3.8 prints too. Each is printed as `name=value`.
 pub const DISPLAY_ALL_VARIABLES: &[&str] = &[
     "alternate_on", "alternate_saved_x", "alternate_saved_y", "command", "config_files",
     "cursor_character", "cursor_flag", "cursor_x", "cursor_y", "history_bytes", "history_limit",
@@ -498,7 +499,7 @@ pub const DISPLAY_ALL_VARIABLES: &[&str] = &[
     "pane_at_left", "pane_at_right", "pane_at_top", "pane_bg", "pane_bottom",
     "pane_current_command", "pane_current_path", "pane_dead", "pane_fg", "pane_format",
     "pane_height", "pane_id", "pane_in_mode", "pane_index", "pane_input_off", "pane_last",
-    "pane_left", "pane_marked", "pane_marked_set", "pane_path", "pane_pid", "pane_pipe",
+    "pane_left", "pane_marked", "pane_marked_set", "pane_path", "pane_pb_progress", "pane_pb_state", "pane_pid", "pane_pipe",
     "pane_right", "pane_search_string", "pane_start_command", "pane_start_path",
     "pane_synchronized", "pane_tabs", "pane_title", "pane_top", "pane_tty",
     "pane_unseen_changes", "pane_width", "pid", "scroll_region_lower", "scroll_region_upper",
@@ -570,6 +571,39 @@ pub fn first_operand<'a>(command: &str, args: &[&'a str]) -> Option<&'a str> {
         i += 1;
     }
     None
+}
+
+/// The option letters of `command` in `args` (the words after the command
+/// name) and the index where its operands start, read the way tmux's getopt
+/// reads them (arguments.c): options end at `--` (the operands start after
+/// it), at a bare `-` or at the first word that does not start with `-`. A
+/// value-taking letter takes the rest of its word or the next word, so its
+/// value is never an option. The words of a shell command, such as
+/// `pwsh -NoProfile -Command ...` in `split-window -d pwsh -NoProfile`, are
+/// operands, never options (#1051).
+pub fn options_and_operand_start<S: AsRef<str>>(command: &str, args: &[S]) -> (String, usize) {
+    let mut letters = String::new();
+    let mut i = 0;
+    while i < args.len() {
+        let word = args[i].as_ref();
+        if word == "--" {
+            return (letters, i + 1);
+        }
+        let Some(rest) = word.strip_prefix('-').filter(|rest| !rest.is_empty()) else {
+            break;
+        };
+        i += 1;
+        for (at, flag) in rest.char_indices() {
+            letters.push(flag);
+            if flag == 't' || flag_takes_value(command, flag) {
+                if at + flag.len_utf8() == rest.len() {
+                    i += 1; // the value is the next word
+                }
+                break;
+            }
+        }
+    }
+    (letters, i.min(args.len()))
 }
 
 /// Split clustered short flags into one token per flag, as tmux's getopt
@@ -1542,6 +1576,8 @@ SET OPTIONS (use with: set -g <option> <value>):
     monitor-silence     Int  Seconds before silence flag (default: 0)
     synchronize-panes   Bool Send input to all panes (default: off)
     remain-on-exit      Keep panes after process exits: off, on, failed, key, failed-key (default: off)
+    scroll-on-clear     Bool Send the screen to history when it is cleared (default: on)
+    cursor-colour       Str  Colour of the cursor, under OSC 12 from the pane (default: none)
     aggressive-resize   Bool Resize to smallest client (default: off)
     set-titles          Bool Update terminal title (default: off)
     set-titles-string   Str  Terminal title format
@@ -1706,88 +1742,6 @@ pub fn print_version() {
     println!("{}", build_version_string());
 }
 
-pub fn print_commands() {
-    println!(r#"Available commands:
-  attach-session (attach)   - Attach to a session
-  bind-key (bind)           - Bind a key to a command
-  break-pane                - Break a pane into a new window
-  capture-pane              - Capture the contents of a pane
-  choose-buffer (chooseb)   - Choose a paste buffer interactively
-  choose-tree               - Choose a session, window or pane from a tree
-  clear-history (clearhist) - Clear pane scrollback history
-  clock-mode                - Display a large clock in current pane
-  confirm-before (confirm)  - Run command after confirmation
-  copy-mode                 - Enter copy mode
-  delete-buffer             - Delete a paste buffer
-  detach-client (detach)    - Detach from the current session
-  display-menu (menu)       - Display a menu
-  display-message           - Display a message in the status line
-  display-panes             - Display pane numbers
-  display-popup (popup)     - Display a popup window
-  find-window (findw)       - Search for a window by name
-  has-session               - Check if a session exists
-  if-shell (if)             - Conditional command execution
-  join-pane                 - Join a pane to a window
-  kill-pane                 - Kill a pane
-  kill-server               - Kill the servers on this socket (-a: all namespaces)
-  kill-session              - Kill a session
-  kill-window               - Kill a window
-  last-pane                 - Select the previously active pane
-  last-window               - Select the previously active window
-  link-window (linkw)       - Link a window to another session
-  list-buffers (lsb)        - List paste buffers
-  list-clients (lsc)        - List connected clients
-  list-commands (lscm)      - List commands
-  list-keys (lsk)           - List key bindings
-  list-panes (lsp)          - List panes in a window
-  list-sessions (ls)        - List sessions
-  list-windows (lsw)        - List windows in a session
-  load-buffer (loadb)       - Load buffer from file
-  lock-client (lockc)       - Lock the client
-  move-pane (movep)         - Move a pane to another window
-  move-window (movew)       - Move a window to a different index
-  new-session (new)         - Create a new session
-  new-window (neww)         - Create a new window
-  next-layout (nextl)       - Cycle to next layout
-  next-window (next)        - Move to the next window
-  paste-buffer              - Paste from a buffer
-  pipe-pane (pipep)         - Pipe pane output to a command
-  previous-window (prev)    - Move to the previous window
-  refresh-client (refresh)  - Refresh client display
-  rename-session            - Rename a session
-  rename-window (renamew)   - Rename a window
-  resize-pane (resizep)     - Resize a pane
-  respawn-pane              - Respawn a pane
-  rotate-window (rotatew)   - Rotate panes in a window
-  run-shell (run)           - Run a shell command
-  save-buffer (saveb)       - Save buffer to file
-  select-layout (selectl)   - Apply a layout preset
-  select-pane (selectp)     - Select a pane
-  select-window (selectw)   - Select a window
-  send-keys                 - Send keys to a pane
-  set-buffer (setb)         - Set a paste buffer
-  set-environment (setenv)  - Set an environment variable
-  set-hook                  - Set a hook command
-  set-option (set)          - Set a session or window option
-  show-buffer (showb)       - Display the contents of a paste buffer
-  show-environment (showenv)- Show environment variables
-  show-hooks                - Show defined hooks
-  show-options (show)       - Show session or window options
-  show-window-options (showw)- Show window options
-  source-file (source)      - Execute commands from a file
-  split-window (splitw)     - Split a window into panes
-  start-server (warmup)     - Pre-spawn a warm server for instant session creation
-  suspend-client (suspendc) - Suspend the client
-  swap-pane (swapp)         - Swap two panes
-  swap-window (swapw)       - Swap two windows
-  switch-client (switchc)   - Switch to another session
-  unbind-key (unbind)       - Unbind a key
-  unlink-window (unlinkw)   - Unlink a window
-  wait-for (wait)           - Wait for a signal
-  zoom-pane (zoom)          - Toggle pane zoom
-"#);
-}
-
 /// Strip the tmux exact-match marker from a raw target specification.
 ///
 /// tmux target grammar allows a leading '=' meaning "match this session name
@@ -1913,6 +1867,62 @@ pub fn bare_target_token(target: &str) -> bool {
         && !t.contains(':')
         && !t.contains('.')
         && !t.starts_with(['%', '@', '$', '~', '='])
+}
+
+/// Is `p` one of the pane tokens tmux resolves against the live window
+/// instead of by index or name?
+///
+/// tmux's `cmd_find_pane_table` (cmd-find.c:59) maps `{last}` to `!`,
+/// `{next}` to `+`, `{previous}` to `-`, keeps the `{up-of}` family as is and
+/// turns `{top}` and friends into layout positions; `cmd_find_get_pane_with_window`
+/// (cmd-find.c:599 to :640) then reads `!` as the window's last pane, the
+/// `{up-of}` family as the active pane's neighbour, and `+N` / `-N` as an
+/// offset by pane number from the active pane (issue #1040).
+pub fn special_pane_token(p: &str) -> bool {
+    match p {
+        "!" | "{last}" | "{next}" | "{previous}"
+        | "{up-of}" | "{down-of}" | "{left-of}" | "{right-of}"
+        | "{top}" | "{bottom}" | "{left}" | "{right}"
+        | "{top-left}" | "{top-right}" | "{bottom-left}" | "{bottom-right}" => true,
+        _ => p
+            .strip_prefix(['+', '-'])
+            .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit())),
+    }
+}
+
+/// A window token from tmux's window table or an offset (`!`, `^`, `$`,
+/// `+N`, `-N`, `{start}`, `{last}`, `{end}`, `{next}`, `{previous}`), as the
+/// window half of a `sess:W` or `:W.P` target.
+pub fn special_window_token(w: &str) -> bool {
+    matches!(w, "!" | "^" | "$" | "{start}" | "{last}" | "{end}" | "{next}" | "{previous}")
+        || w.strip_prefix(['+', '-']).is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Does a `sess:W` / `:W.P` target carry a [`special_window_token`] as its
+/// window half? The generic parser files it as a window NAME, and a pane
+/// command then asked for a window called "+" (#1040).
+pub fn has_special_window_part(target: &str) -> bool {
+    let t = strip_exact_match_prefix(target.trim());
+    let Some(colon) = t.find(':') else { return false };
+    let rest = &t[colon + 1..];
+    let win = rest.find('.').map_or(rest, |d| &rest[..d]);
+    special_window_token(strip_exact_match_prefix(win))
+}
+
+/// Split a `window.pane` target whose pane half is a [`special_pane_token`]
+/// into the part before the dot (session and window, possibly empty) and that
+/// token. tmux splits on the first `.` after the `:` (or the first `.` at all
+/// without one, cmd-find.c:1066 to :1075), so `.-`, `:.+`, `sess:1.!` and
+/// `2.{last}` all qualify. Anything else is `None` and keeps its old reading.
+pub fn split_special_pane_target(target: &str) -> Option<(&str, &str)> {
+    let t = strip_exact_match_prefix(target.trim());
+    if t.starts_with('%') {
+        return None;
+    }
+    let from = t.find(':').map_or(0, |c| c + 1);
+    let dot = from + t[from..].find('.')?;
+    let pane = &t[dot + 1..];
+    special_pane_token(pane).then(|| (&t[..dot], pane))
 }
 
 /// Commands whose `-t` is a window target, where a bare token must be read as
@@ -2328,6 +2338,33 @@ pub fn client_spec_matches(tty: &str, spec: &str) -> bool {
     !t.is_empty() && (tty == t || tty.strip_prefix("/dev/") == Some(t))
 }
 
+/// The session whose server has the most recently active client, from each
+/// session's `list-clients -F '#{client_activity}'` reply, as tmux's
+/// `cmd_find_best_client` picks the current client for a command run outside
+/// any client (cmd-find.c at tag 3.8). psmux runs a server per session, so
+/// the client a `switch-client` acts on may be on any of them. Activity is in
+/// seconds, so a tie goes to `preferred` (where routing already pointed),
+/// then to the first listed. `None` when no session has a client.
+pub fn best_client_session(listings: &[(String, String)], preferred: Option<&str>) -> Option<String> {
+    let mut best: Option<(u64, bool, &str)> = None;
+    for (session, reply) in listings {
+        let Some(activity) = reply.lines().filter_map(|l| l.trim().parse::<u64>().ok()).max() else {
+            continue;
+        };
+        let is_preferred = preferred == Some(session.as_str());
+        let better = match best {
+            None => true,
+            Some((best_activity, best_preferred, _)) => {
+                activity > best_activity || (activity == best_activity && is_preferred && !best_preferred)
+            }
+        };
+        if better {
+            best = Some((activity, is_preferred, session));
+        }
+    }
+    best.map(|(_, _, session)| session.to_string())
+}
+
 /// The client flags an `attach-session` argument list asks for.
 ///
 /// tmux spells read only `-r` (cmd-attach-session.c, "c:dEf:rt:x", which sets
@@ -2592,6 +2629,10 @@ mod tests_issue829_client_path;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue865_display_reply_error.rs"]
 mod tests_issue865_display_reply_error;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_switch_client_best_client.rs"]
+mod tests_switch_client_best_client;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_empty_pane_target.rs"]

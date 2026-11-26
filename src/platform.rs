@@ -282,6 +282,54 @@ pub fn process_is_alive(pid: u32) -> bool {
     }
 }
 
+/// True only on a POSITIVE sign that `pid` has exited or is exiting: a handle
+/// opened and the process already has an exit status.
+///
+/// The strict counterpart of [`process_is_alive`], for callers where a pid that
+/// cannot be opened must NOT be read as dead (a live server in another Terminal
+/// Services session refuses the handle, #650). It exists for the window right
+/// after a process is terminated: until the kernel finishes tearing it down it
+/// is still in the process table under its image name and
+/// QueryFullProcessImageNameW still answers, so a name based liveness check
+/// calls it alive. Measured 2026-11-20 on 10.0.26300: after `Stop-Process
+/// -Force` and Wait-Process, 2 of 90 killed servers were in exactly that state
+/// (exit code 0xFFFFFFFF, still listed as psmux), and their registries were the
+/// only ones a cleanup pass left behind.
+///
+/// The exit code, not the handle's signaled state, is the signal: the status is
+/// recorded when termination starts, but the object is signaled only once every
+/// thread has unwound, and a first version that waited on the handle still left
+/// 3 of 20 runs with survivors in that state. A process with an exit status
+/// other than STILL_ACTIVE never runs user code again. A process that is
+/// running, or that exited with 259 itself, reads as not exited, which only
+/// errs towards keeping a registry, as before.
+#[cfg(windows)]
+pub fn process_has_exited(pid: u32) -> bool {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
+        fn GetExitCodeProcess(hProcess: isize, lpExitCode: *mut u32) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h == 0 {
+            return false; // unknown, not dead
+        }
+        let mut code: u32 = STILL_ACTIVE;
+        let ok = GetExitCodeProcess(h, &mut code);
+        CloseHandle(h);
+        ok != 0 && code != STILL_ACTIVE
+    }
+}
+
+#[cfg(not(windows))]
+pub fn process_has_exited(_pid: u32) -> bool {
+    false
+}
+
 /// A SYNCHRONIZE handle on one process, so its exit can be waited on as an
 /// event instead of on a timer. Open it while the pid is known to be the
 /// process meant (a pid is only a name until a handle pins it).
@@ -1414,6 +1462,9 @@ pub mod mouse_inject {
     // dwEventFlags
     pub const MOUSE_MOVED: u32       = 0x0001;
     pub const MOUSE_WHEELED: u32     = 0x0004;
+    /// Horizontal wheel (tilt wheel, trackpad sideways swipe): a positive
+    /// high word is right, a negative one left.
+    pub const MOUSE_HWHEELED: u32    = 0x0008;
 
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
@@ -1641,6 +1692,7 @@ pub mod mouse_inject {
     /// different causes.
     fn attach_error_meaning(err: u32) -> &'static str {
         match err {
+            1 => "ERROR_INVALID_FUNCTION: seen right after this process attached to and left the same console, and a retry a millisecond later takes",
             5 => "ERROR_ACCESS_DENIED: the caller is still attached to a console, or the target console refuses this caller (integrity or session mismatch)",
             6 => "ERROR_INVALID_HANDLE: that process exists but has no console",
             87 => "ERROR_INVALID_PARAMETER: no process with that id",
@@ -1833,6 +1885,10 @@ pub mod mouse_inject {
     #[path = "../../../tests-rs/test_issue989_attach_ctrl_c.rs"]
     mod tests_issue989_attach_ctrl_c;
 
+    #[cfg(test)]
+    #[path = "../../../tests-rs/test_attach_console_retry.rs"]
+    mod tests_attach_console_retry;
+
     unsafe fn free_and_attach_unguarded(child_pid: u32, site: &str) -> bool {
         let target = if fake_inject_fail() {
             debug_log(&format!(
@@ -1850,6 +1906,32 @@ pub mod mouse_inject {
         if AttachConsole(target) != 0 { return true; }
         let child_pid = target;
         let err1 = GetLastError();
+
+        let delays = attach_retry_delays_ms(err1);
+        if !delays.is_empty() {
+            let mut last = err1;
+            for (n, ms) in delays.iter().enumerate() {
+                std::thread::sleep(std::time::Duration::from_millis(*ms));
+                let freed_again = FreeConsole();
+                if AttachConsole(child_pid) != 0 {
+                    debug_log(&format!(
+                        "{}: AttachConsole({}) failed err={}, then succeeded on retry {} after {} ms \
+                         (FreeConsole ok={})",
+                        site, child_pid, err1, n + 1, ms, freed_again != 0
+                    ));
+                    return true;
+                }
+                last = GetLastError();
+            }
+            if debug_enabled() {
+                debug_log(&format!(
+                    "{} | {} retries failed, the last with err={} ({})",
+                    attach_failure_report(site, child_pid, &before, freed, free_err, err1, None),
+                    delays.len(), last, attach_error_meaning(last)
+                ));
+            }
+            return false;
+        }
 
         if err1 == 5 {
             // Still attached is the documented meaning, and a second detach is
@@ -1882,6 +1964,21 @@ pub mod mouse_inject {
             ));
         }
         false
+    }
+
+    /// How long to wait before each further attach after `AttachConsole`
+    /// failed with `err`.  Only ERROR_INVALID_FUNCTION (1) is retried here:
+    /// it came back now and then for an attach right after this process had
+    /// attached to and left the same console (the 2 s console mode re-check
+    /// runs just before a wheel record goes in), and the record was dropped.
+    /// Measured under the test runner, 10 of 10 took on the first retry, 1 ms
+    /// later.  Error 5 has its own immediate retry, and 6 and 87 (no console,
+    /// no process) cannot change by waiting.
+    pub(crate) fn attach_retry_delays_ms(err: u32) -> &'static [u64] {
+        match err {
+            1 => &[1, 2, 4],
+            _ => &[],
+        }
     }
 
     /// Extract the process ID from a portable_pty::Child trait object.
@@ -2217,6 +2314,31 @@ pub mod mouse_inject {
             debug_log(&format!("query_console_input_mode: pid={} mode=0x{:04X} ENABLE_MOUSE_INPUT={}",
                 child_pid, mode, (mode & ENABLE_MOUSE_INPUT) != 0));
             Some(mode)
+        }
+    }
+
+    /// Members of the console that actually receives input for this pane.
+    /// A descendant may own a private pseudoconsole (a TUI tool subprocess),
+    /// so process ancestry alone cannot select the mouse injection transport.
+    pub fn query_console_process_ids(child_pid: u32) -> Option<Vec<u32>> {
+        let _console_guard = portable_pty::console_state_lock();
+        unsafe {
+            let had_console = GetConsoleWindow() != 0;
+            if !free_and_attach(child_pid, "query_console_process_ids") {
+                if had_console { reattach_parent_console(); }
+                return None;
+            }
+            let mut pids = vec![0u32; 64];
+            let mut n = GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32);
+            if n as usize > pids.len() {
+                pids.resize(n as usize, 0);
+                n = GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32);
+            }
+            detach_console();
+            if had_console { reattach_parent_console(); }
+            if n == 0 || n as usize > pids.len() { return None; }
+            pids.truncate(n as usize);
+            Some(pids)
         }
     }
 
@@ -2868,10 +2990,19 @@ pub mod mouse_inject {
             }
         }
 
-        if crate::platform::process_info::foreground_is_vt_bridge(child_pid) {
-            log(&format!("vt-bridge foreground under pid={}: deliver raw 0x03 only, skip CTRL_C_EVENT", child_pid));
-            strip_processed_input(child_pid, &log);
-            return false;
+        // Issue #1024 follow up: ancestry alone does not decide.  A bridge on a
+        // PRIVATE console (an `ssh -N` tunnel a TUI or tool started with its
+        // own console) is out of the broadcast's reach, and stripping
+        // PROCESSED_INPUT for it left a cooked pane with no interrupt at all
+        // (measured: `for /l` in cmd, 0 of 6 interrupted).  When the bridge
+        // is in the tree, the attached stage below reads the console's real
+        // membership in the same attach the strip would have cost, and skips
+        // the broadcast for both lethal shapes (bridge on the console, or a
+        // Cygwin/MSYS shell on it).
+        let bridge_in_tree = crate::platform::process_info::foreground_is_vt_bridge(child_pid)
+            || crate::platform::process_info::has_vt_bridge_descendant(child_pid);
+        if bridge_in_tree {
+            log(&format!("vt-bridge in the tree under pid={}: console membership decides", child_pid));
         }
 
         // Issue #579, third guard: a bridge ANYWHERE in the pane's process
@@ -2883,12 +3014,8 @@ pub mod mouse_inject {
         // keep their PPID links intact, so the descendant BFS is reliable
         // exactly where the leaf heuristic is not.  A bridge in the tree
         // forwards the raw 0x03 into its guest itself; the broadcast is
-        // redundant for it and fatal to it.
-        if crate::platform::process_info::has_vt_bridge_descendant(child_pid) {
-            log(&format!("vt-bridge descendant under pid={}: deliver raw 0x03 only, skip CTRL_C_EVENT", child_pid));
-            strip_processed_input(child_pid, &log);
-            return false;
-        }
+        // redundant for it and fatal to it when it can reach it.  That BFS is
+        // part of `bridge_in_tree` above; the attached stage decides.
 
         // Issue #579, boot-window guard (the reproduced kill): while the WSL
         // VM boots (~1-2s cold), the live wsl.exe processes are parented by
@@ -2921,7 +3048,10 @@ pub mod mouse_inject {
         // long as the cold boot: once the bridge is a real child on a real
         // console the descendant BFS and the console-membership check see it,
         // so bounding by age loses no protection.
-        if crate::platform::process_info::foreground_fell_back_to_root(child_pid) {
+        // A bridge already seen in the tree is not the blind boot state this
+        // guard is for, and the attached stage below decides for it; skipping
+        // the system wide recency scan keeps this press as cheap as before.
+        if !bridge_in_tree && crate::platform::process_info::foreground_fell_back_to_root(child_pid) {
             if let Some((bridge_pid, age)) =
                 crate::platform::process_info::recently_started_vt_bridge(
                     crate::platform::process_info::BRIDGE_BOOT_WINDOW,
@@ -3561,6 +3691,7 @@ pub mod mouse_inject {
     pub const FROM_LEFT_2ND_BUTTON_PRESSED: u32 = 0x0004;
     pub const MOUSE_MOVED: u32 = 0x0001;
     pub const MOUSE_WHEELED: u32 = 0x0004;
+    pub const MOUSE_HWHEELED: u32 = 0x0008;
     pub fn get_child_pid(_child: &dyn portable_pty::Child) -> Option<u32> { None }
     pub fn send_mouse_event(_pid: u32, _col: i16, _row: i16, _btn: u32, _flags: u32, _reattach: bool) -> bool { false }
     pub fn send_vt_sequence(_pid: u32, _sequence: &[u8]) -> bool { false }
@@ -3570,6 +3701,7 @@ pub mod mouse_inject {
     pub fn send_ctrl_break_event(_pid: u32, _reattach: bool) -> bool { false }
     pub fn query_mouse_input_enabled(_pid: u32) -> Option<bool> { None }
     pub fn query_console_input_mode(_pid: u32) -> Option<u32> { None }
+    pub fn query_console_process_ids(_pid: u32) -> Option<Vec<u32>> { None }
     pub fn send_vt_response(_pid: u32, _text: &str) -> bool { false }
     pub fn inject_paste(_pid: u32, _text: &str, _abort: &std::sync::atomic::AtomicBool) -> crate::pane::PasteInjectResult {
         crate::pane::PasteInjectResult { consumed: 0, complete: false }
@@ -4240,7 +4372,7 @@ pub mod process_kill {
     const TCP_TABLE_OWNER_PID_CONNECTIONS: u32 = 4;
 
     /// One IPv4 TCP table row whose local address is 127.0.0.1.
-    struct LoopbackTcpRow { local_port: u16, remote_port: u16, pid: u32 }
+    struct LoopbackTcpRow { state: u32, local_port: u16, remote_port: u16, pid: u32 }
 
     fn loopback_tcp_rows(table_class: u32) -> Vec<LoopbackTcpRow> {
         let mut out = Vec::new();
@@ -4281,6 +4413,7 @@ pub mod process_kill {
                 let local_addr = (row.add(4) as *const u32).read_unaligned();
                 if local_addr != LOOPBACK_ADDR { continue; }
                 out.push(LoopbackTcpRow {
+                    state: (row as *const u32).read_unaligned(),
                     local_port: port_of((row.add(8) as *const u32).read_unaligned()),
                     remote_port: port_of((row.add(16) as *const u32).read_unaligned()),
                     pid: (row.add(20) as *const u32).read_unaligned(),
@@ -4302,6 +4435,34 @@ pub mod process_kill {
             .into_iter()
             .find(|r| r.local_port == peer_port && r.remote_port == our_port && r.pid != 0)
             .map(|r| r.pid)
+    }
+
+    /// Whether the SERVER end of our loopback connection has closed: the row
+    /// whose local port is the server's and whose remote port is ours is gone,
+    /// or is in a closing state (MIB_TCP_STATE: FIN_WAIT1 6, FIN_WAIT2 7,
+    /// CLOSING 9, LAST_ACK 10, TIME_WAIT 11, CLOSED 1, DELETE_TCB 12).
+    ///
+    /// A client waiting for EOF asks this when its read has been idle for a
+    /// while. On an ordinary machine the server's FIN reaches the client at
+    /// once, so the read ends first and this is never decisive. Some loopback
+    /// stream filters swallow that FIN: the server is done and gone while the
+    /// client sits ESTABLISHED for ever. The kernel's own table is the one
+    /// witness the filter cannot hide.
+    pub fn loopback_server_end_closed(server_port: u16, our_port: u16) -> bool {
+        const CLOSED: u32 = 1;
+        const FIN_WAIT1: u32 = 6;
+        const FIN_WAIT2: u32 = 7;
+        const CLOSING: u32 = 9;
+        const LAST_ACK: u32 = 10;
+        const TIME_WAIT: u32 = 11;
+        const DELETE_TCB: u32 = 12;
+        match loopback_tcp_rows(TCP_TABLE_OWNER_PID_CONNECTIONS)
+            .into_iter()
+            .find(|r| r.local_port == server_port && r.remote_port == our_port)
+        {
+            None => true,
+            Some(r) => matches!(r.state, CLOSED | FIN_WAIT1 | FIN_WAIT2 | CLOSING | LAST_ACK | TIME_WAIT | DELETE_TCB),
+        }
     }
 
     /// Current system time as a FILETIME (100ns ticks). Callers capture this
@@ -4355,6 +4516,7 @@ pub mod process_kill {
     // Orphaned-server reaper stubs (issue #448) — no-ops off Windows.
     pub fn loopback_listener_pids() -> Vec<(u32, u16)> { Vec::new() }
     pub fn loopback_peer_pid(_peer_port: u16, _our_port: u16) -> Option<u32> { None }
+    pub fn loopback_server_end_closed(_server_port: u16, _our_port: u16) -> bool { false }
     pub fn now_process_filetime() -> u64 { 0 }
     pub fn process_creation_time(_pid: u32) -> Option<u64> { None }
     pub fn terminate_server_pid(_pid: u32, _max_creation_ft: Option<u64>) {}
@@ -4677,7 +4839,7 @@ pub mod process_info {
         let path = format!("{}/autorename.log", crate::paths::psmux_dir());
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
             use std::io::Write;
-            let _ = writeln!(f, "[{}] {}", chrono::Local::now().format("%H:%M:%S%.3f"), msg);
+            let _ = writeln!(f, "[{}] {}", crate::strftime::now_string("%H:%M:%S%.3f"), msg);
         }
     }
 
@@ -4843,7 +5005,27 @@ pub mod process_info {
 
     /// Get the CWD of the foreground process in the pane.
     pub fn get_foreground_cwd(pid: u32) -> Option<String> {
-        if let Some(target) = find_foreground_child_pid(pid) {
+        foreground_cwd_from(pid, find_foreground_child_pid(pid))
+    }
+
+    /// `get_foreground_cwd` for a one-shot query (`display-message -p`,
+    /// `list-panes -F`, `split-window -c '#{pane_current_path}'`), which has
+    /// no next frame to correct a stale answer.  Same walk, but the process
+    /// table is never served past `RENDER_PATH_TTL`: the render-path table can
+    /// predate a child the shell started moments ago (`pwsh -Command cmd.exe`
+    /// for `split-window cmd.exe`), and with no child in it the walk read the
+    /// wrapper's directory, so the reply was the folder the user had just left
+    /// until a background refresh landed.  The same split
+    /// `get_deepest_foreground_process_name_fresh` makes for
+    /// `#{pane_current_command}`.
+    pub fn get_foreground_cwd_fresh(pid: u32) -> Option<String> {
+        let target = process_table_bounded(RENDER_PATH_TTL)
+            .and_then(|entries| foreground_child_in(&entries, pid, &mut |p| entries.creation_of(p)));
+        foreground_cwd_from(pid, target)
+    }
+
+    fn foreground_cwd_from(pid: u32, foreground: Option<u32>) -> Option<String> {
+        if let Some(target) = foreground {
             if target != pid {
                 if let Some(cwd) = get_process_cwd(target) {
                     return Some(cwd);
@@ -5636,6 +5818,29 @@ pub mod process_info {
             Some(t) => t,
             None => return false,
         };
+        console_contains_vt_bridge(&entries, pids)
+    }
+
+    /// Mouse transport choice (issue #1024): a VT bridge counts only when it
+    /// is both under the pane and on the pane's console.  One live walk
+    /// answers both halves, and `console_pids` (which attaches to the pane
+    /// console) runs only when the tree holds a bridge at all, so a pane with
+    /// no ssh or wsl under it never pays for the attach.
+    pub fn vt_bridge_on_pane_console(
+        root_pid: u32,
+        console_pids: impl FnOnce() -> Option<Vec<u32>>,
+    ) -> bool {
+        let entries = match process_table(std::time::Duration::ZERO) {
+            Some(t) => t,
+            None => return false,
+        };
+        if !tree_has_vt_bridge(&entries, root_pid, &mut |p| entries.creation_of(p)) {
+            return false;
+        }
+        console_pids().is_some_and(|pids| console_contains_vt_bridge(&entries, &pids))
+    }
+
+    fn console_contains_vt_bridge(entries: &[ProcRowT], pids: &[u32]) -> bool {
         entries.iter().any(|(pid, _, name)| pids.contains(pid) && is_vt_bridge_exe(name))
     }
 
@@ -5781,6 +5986,10 @@ pub mod process_info {
     mod tests_proc_table_cache;
 
     #[cfg(test)]
+    #[path = "../../../tests-rs/test_mouse_bridge_console_scope.rs"]
+    mod tests_mouse_bridge_console_scope;
+
+    #[cfg(test)]
     #[path = "../../../tests-rs/test_issue579_any_vt_bridge.rs"]
     mod tests_issue579_any_vt_bridge;
 
@@ -5810,7 +6019,12 @@ pub mod process_info {
     pub fn get_deepest_foreground_process_name(_pid: u32) -> Option<String> { None }
     pub fn get_deepest_foreground_process_name_fresh(_pid: u32) -> Option<String> { None }
     pub fn get_foreground_cwd(_pid: u32) -> Option<String> { None }
+    pub fn get_foreground_cwd_fresh(_pid: u32) -> Option<String> { None }
     pub fn has_vt_bridge_descendant(_root_pid: u32) -> bool { false }
+    pub fn vt_bridge_on_pane_console(
+        _root_pid: u32,
+        _console_pids: impl FnOnce() -> Option<Vec<u32>>,
+    ) -> bool { false }
     pub fn tree_has_vt_bridge_cached(_root_pid: u32) -> bool { false }
     pub fn foreground_is_shell(_root_pid: u32) -> Option<bool> { None }
     pub fn foreground_is_vt_bridge(_root_pid: u32) -> bool { false }

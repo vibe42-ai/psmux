@@ -3,6 +3,13 @@
 pub struct Parser<CB: crate::callbacks::Callbacks = ()> {
     parser: vte::Parser,
     screen: crate::perform::WrappedScreen<CB>,
+    passthrough: crate::passthrough::Passthrough,
+    /// The last call's bytes ended inside a DCS introducer that has not
+    /// reached its final byte (`ESC`, `ESC P`, `ESC P 1;2`), which may still
+    /// turn out to be `ESC P tmux;`.
+    dcs_may_continue: bool,
+    /// The last call's bytes ended in ESC; see [`Parser::process`].
+    conhost_prev_esc: bool,
 }
 
 impl Parser {
@@ -17,6 +24,9 @@ impl Parser {
                 cols,
                 scrollback_len,
             ),
+            passthrough: crate::passthrough::Passthrough::default(),
+            dcs_may_continue: false,
+            conhost_prev_esc: false,
         }
     }
 }
@@ -40,6 +50,9 @@ impl<CB: crate::callbacks::Callbacks> Parser<CB> {
                 scrollback_len,
                 callbacks,
             ),
+            passthrough: crate::passthrough::Passthrough::default(),
+            dcs_may_continue: false,
+            conhost_prev_esc: false,
         }
     }
 
@@ -58,9 +71,13 @@ impl<CB: crate::callbacks::Callbacks> Parser<CB> {
     {
         let mut screen = self.screen.screen.clone();
         screen.capture_queries(false);
+        screen.take_host_events();
         Self {
             parser: vte::Parser::new(),
             screen: crate::perform::WrappedScreen::from_screen(screen, CB::default()),
+            passthrough: crate::passthrough::Passthrough::default(),
+            dcs_may_continue: false,
+            conhost_prev_esc: false,
         }
     }
 
@@ -83,7 +100,119 @@ impl<CB: crate::callbacks::Callbacks> Parser<CB> {
     /// Processes the contents of the given byte string, and updates the
     /// in-memory terminal state.
     pub fn process(&mut self, bytes: &[u8]) {
-        self.parser.advance(&mut self.screen, bytes);
+        if !self.screen.conhost_c0_cells {
+            self.process_vt(bytes);
+            return;
+        }
+        // The inbox conhost of Windows 10 has no DCS parser: for an
+        // application's `ESC P tmux; ESC ESC ] ... ESC \` it prints `tmux;`
+        // into its buffer and forwards the inner OSC as it cached it, both
+        // escapes included. Two escapes in a row arrive from no other source,
+        // so at the second one the screen learns that the next text conhost
+        // paints may be that body (issue #972, see `arm_conhost_dcs_body`).
+        let mut rest = bytes;
+        let mut prev_esc = self.conhost_prev_esc;
+        loop {
+            let second = if prev_esc && rest.first() == Some(&0x1b) {
+                Some(0)
+            } else {
+                memchr::memmem::find(rest, b"\x1b\x1b").map(|i| i + 1)
+            };
+            let Some(i) = second else { break };
+            if i > 0 {
+                self.process_vt(&rest[..i]);
+            }
+            if !self.passthrough.active() {
+                self.screen.arm_conhost_dcs_body();
+            }
+            rest = &rest[i..];
+            prev_esc = false;
+        }
+        self.process_vt(rest);
+        self.conhost_prev_esc = bytes.last() == Some(&0x1b);
+    }
+
+    fn process_vt(&mut self, bytes: &[u8]) {
+        let mut rest = bytes;
+        let mut dcs_may_continue =
+            std::mem::replace(&mut self.dcs_may_continue, dcs_introducer_open(bytes));
+        if self.passthrough.expired() {
+            self.passthrough.end();
+            self.parser.advance(&mut self.screen, b"\x1b\\");
+        }
+        loop {
+            if self.passthrough.active() {
+                let skipped = self.passthrough.skip(rest);
+                for event in self.passthrough.take_completed() {
+                    self.screen.screen.push_host_passthrough(event.bytes);
+                }
+                match skipped {
+                    crate::passthrough::Skip::More => return,
+                    crate::passthrough::Skip::End { resume, close } => {
+                        if let Some(body) = self.passthrough.take_body() {
+                            self.screen.screen.push_host_passthrough(body);
+                        }
+                        self.parser.advance(&mut self.screen, close);
+                        if close == b"\x1b" {
+                            // The ESC was handed to VTE separately; resume may
+                            // start with Ptmux;, which still needs its stop check.
+                            dcs_may_continue = true;
+                        }
+                        rest = &rest[resume..];
+                    }
+                }
+            }
+            // Nothing before the first `ESC P` can begin a passthrough, so it
+            // goes through vte's plain `advance`: the per byte `terminated`
+            // check below cost about 4% on SGR heavy output.
+            let start = if dcs_may_continue || self.screen.tmux_prefix_pending() {
+                0
+            } else {
+                dcs_start(rest).unwrap_or(rest.len())
+            };
+            dcs_may_continue = false;
+            if start > 0 {
+                self.parser.advance(&mut self.screen, &rest[..start]);
+                rest = &rest[start..];
+            }
+            if rest.is_empty() {
+                return;
+            }
+            // Stops right after an `ESC P tmux;`, so its body is skipped
+            // above instead of parsed (see `passthrough`).
+            let n = self.parser.advance_until_terminated(&mut self.screen, rest);
+            rest = &rest[n..];
+            if !self.screen.take_tmux_passthrough() {
+                return;
+            }
+            self.passthrough.begin();
+        }
+    }
+
+    /// Read C0 controls the way the inbox Windows console host writes them:
+    /// as cells of one column each (issue #972). New parsers take
+    /// [`set_conhost_c0_cells_default`](crate::set_conhost_c0_cells_default).
+    pub fn set_conhost_c0_cells(&mut self, on: bool) {
+        self.screen.conhost_c0_cells = on;
+    }
+
+    /// Whether this parser reads C0 controls as conhost cells.
+    #[must_use]
+    pub fn conhost_c0_cells(&self) -> bool {
+        self.screen.conhost_c0_cells
+    }
+
+    /// Read the Windows 10 inbox conhost's C1 cells and `CSI 25 h` / `l`. New
+    /// parsers take
+    /// [`set_conhost_win10_default`](crate::set_conhost_win10_default).
+    pub fn set_conhost_win10(&mut self, on: bool) {
+        self.screen.conhost_win10 = on;
+    }
+
+    /// Whether this parser reads the Windows 10 inbox conhost's quirks.
+    #[must_use]
+    pub fn conhost_win10(&self) -> bool {
+        self.screen.conhost_win10
     }
 
     /// Returns a reference to a [`Screen`](crate::Screen) object containing
@@ -129,5 +258,24 @@ impl std::io::Write for Parser {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// Where the first `ESC P` in `bytes` starts.
+fn dcs_start(bytes: &[u8]) -> Option<usize> {
+    memchr::memmem::find(bytes, b"\x1bP")
+}
+
+/// Whether `bytes` ends inside an escape that may still become the start of
+/// a DCS (a lone ESC) or a DCS introducer without its final byte yet (`ESC P`
+/// and parameter or intermediate bytes).
+fn dcs_introducer_open(bytes: &[u8]) -> bool {
+    let Some(e) = memchr::memrchr(0x1b, bytes) else {
+        return false;
+    };
+    match &bytes[e + 1..] {
+        [] => true,
+        [b'P', tail @ ..] => tail.iter().all(|b| (0x20..=0x3f).contains(b)),
+        _ => false,
     }
 }

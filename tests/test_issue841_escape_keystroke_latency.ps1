@@ -155,8 +155,12 @@ function Assert-Route($name, $res, [switch]$EscMayWait, [double]$EscCeiling = 0)
     }
 }
 
+# The inbox pseudo console of Windows 10 (19045) has no win32-input-mode, so
+# the w32 route (Part 1, and the w32 half of Part 5) cannot be driven there.
+$NoW32 = [Environment]::OSVersion.Version.Build -lt 22000
 Write-Host "`n[Part 1] win32-input-mode route (what Windows Terminal writes)" -ForegroundColor Yellow
-Assert-Route "win32-input-mode" (Invoke-PtyRoute 'w32' '')
+if ($NoW32) { Write-Host "  [SKIP] Windows 10 inbox pseudo console has no win32-input-mode" -ForegroundColor Yellow }
+else { Assert-Route "win32-input-mode" (Invoke-PtyRoute 'w32' '') }
 
 Write-Host "`n[Part 2] classic console window, key held 80 ms like a person" -ForegroundColor Yellow
 Assert-Route "classic console" (Invoke-ClassicRoute)
@@ -198,17 +202,37 @@ function Invoke-PrefixCheck([string]$route) {
     if (-not $h.WaitForExit(40000)) { Stop-Process -Id $h.Id -Force -EA SilentlyContinue }
     & $PSMUX -L $ns kill-server 2>&1 | Out-Null
     $r = @{}
-    Get-Content $hlog -EA SilentlyContinue | ForEach-Object { if ($_ -match '^\S+ (\w+) => (\d+):(\d+)') { $r[$Matches[1]] = @([int]$Matches[2], [int]$Matches[3]) } }
+    $writes = @()
+    Get-Content $hlog -EA SilentlyContinue | ForEach-Object {
+        if ($_ -match '^\S+ (\w+) => (\d+):(\d+)') {
+            $r[$Matches[1]] = @([int]$Matches[2], [int]$Matches[3])
+            # The two writes just before the "down" reading are the split
+            # Down: ESC, then [B. Their logged times give the gap psmux saw.
+            if ($Matches[1] -eq 'down' -and $writes.Count -ge 2) { $r['downgap'] = [Math]::Round($writes[-1] - $writes[-2], 1) }
+        } elseif ($_ -match '^(\d+\.\d+) k$') { $writes += [double]$Matches[1] }
+    }
     $r
 }
 foreach ($route in 'w32', 'vt') {
     Write-Host "`n[Part 5] prefix keys on the $route route" -ForegroundColor Yellow
+    if ($route -eq 'w32' -and $NoW32) { Write-Host "  [SKIP] Windows 10 inbox pseudo console has no win32-input-mode" -ForegroundColor Yellow; continue }
     $r = Invoke-PrefixCheck $route
+    # The split Down only tests the escape-time wait when [B reached psmux
+    # inside escape-time (10). The gap is taken where the host writes, and
+    # the pipe and conhost add to it, so a try whose write gap was over twice
+    # the 4 ms asked (9.8 ms once) is run again rather than counted.
+    $late = { $route -eq 'vt' -and $r['down'] -and $r['down'][0] -ne 1 -and $r['downgap'] -ge 8 }
+    for ($try = 2; $try -le 3 -and (& $late); $try++) {
+        Write-Host "  [INFO] [B was written $($r['downgap']) ms after ESC, over twice the 4 ms asked; try $try" -ForegroundColor DarkGray
+        $r = Invoke-PrefixCheck $route
+    }
     if (-not $r['start'] -or -not $r['altup']) { Write-Fail "$route prefix check: no pane readings ($(($r.Keys) -join ','))"; continue }
     if ($r['start'][0] -eq 1 -and $r['up'][0] -eq 0) { Write-Pass "$route prefix Up selected the pane above (1 -> 0)" }
     else { Write-Fail "$route prefix Up: pane $($r['start'][0]) -> $($r['up'][0])" }
-    if ($r['down'][0] -eq 1) { Write-Pass "$route prefix Down came back (0 -> 1)$(if ($route -eq 'vt') { ', written as ESC then [B 4 ms apart' })" }
-    else { Write-Fail "$route prefix Down: pane $($r['up'][0]) -> $($r['down'][0])" }
+    $gapNote = if ($route -eq 'vt') { ", written as ESC then [B $($r['downgap']) ms apart (4 asked, escape-time 10)" } else { '' }
+    if ($r['down'][0] -eq 1) { Write-Pass "$route prefix Down came back (0 -> 1)$gapNote" }
+    elseif (& $late) { Write-Host "  [SKIP] $route prefix Down: [B was written late on all 3 tries$gapNote" -ForegroundColor Yellow }
+    else { Write-Fail "$route prefix Down: pane $($r['up'][0]) -> $($r['down'][0])$gapNote" }
     if ($r['altup'][1] -ne $r['down'][1]) { Write-Pass "$route prefix Alt+Up resized the pane (height $($r['down'][1]) -> $($r['altup'][1]))" }
     else { Write-Fail "$route prefix Alt+Up left the height at $($r['altup'][1])" }
 }

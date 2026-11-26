@@ -64,7 +64,13 @@ param(
     [switch]$SkipDirect,
     # Set PSMUX_PTY_TRACE=<TraceDir>\trace for the client and the server it
     # starts, so a slow key can be followed hop by hop (src/pty_trace.rs).
-    [string]$TraceDir = ""
+    [string]$TraceDir = "",
+    # Type these lines (one per line, UTF-8) instead of the built in sentences,
+    # and file the metrics under another suite name. test_long_paragraph_benchmark
+    # uses this for its ~260 character paragraphs at 15 ms per key.
+    [string]$TextFile = "",
+    [string]$SuiteName = "test_typing_benchmark",
+    [string]$MetricsStem = "typing-benchmark"
 )
 
 $ErrorActionPreference = "Continue"
@@ -118,6 +124,10 @@ $sentences = @(
     "back in june we delivered oxygen equipment of the same size to the city"
     "playing a quiet game of chess with the king requires very careful moves"
 )
+if ($TextFile) {
+    $sentences = @(Get-Content -LiteralPath $TextFile -Encoding UTF8 | Where-Object { $_.Trim() })
+    if ($sentences.Count -eq 0) { Write-Fail "no text in $TextFile"; exit 1 }
+}
 
 $NS = "typbench$PID"
 $S = "bench"
@@ -127,6 +137,7 @@ $prevDataDir = $env:PSMUX_DATA_DIR
 $env:PSMUX_DATA_DIR = $DATA
 
 $psmuxRows = @(); $ctrlcFirst = @(); $directRows = @()
+$script:TypingResources = $null
 $psmuxAll = [System.Collections.Generic.List[double]]::new()
 $directAll = [System.Collections.Generic.List[double]]::new()
 $held = 0; $lost = 0
@@ -150,7 +161,18 @@ try {
     if (-not $ready) { Write-Fail "the psmux pane never showed a prompt"; throw "no prompt" }
     Start-Sleep -Seconds 1
 
+    # Memory, handles and CPU of the server and the attached client across the
+    # whole typing phase, so the JSON says what the keystrokes cost as well as
+    # how fast they were. The server is found by its pid anchor, never by name.
+    $srvPid = Get-PerfServerPid -Ns $NS -Session $S -DataDir $DATA
+    $roles = [ordered]@{}
+    if ($srvPid -gt 0) { $roles["server"] = $srvPid }
+    if ($client -and -not $client.HasExited) { $roles["client"] = $client.Id }
+    $resAtPrompt = Get-PerfResourceSnapshot $roles
+    Write-Info (Format-PerfResourceLine $resAtPrompt "at prompt")
+
     $n = 0
+    $typingScn = Start-PerfScenario -Name "typing" -Roles $roles
     foreach ($sentence in $sentences) {
         $n++
         & $Binary -L $NS send-keys -t $S C-c 2>&1 | Out-Null
@@ -170,6 +192,10 @@ try {
         $psmuxRows += $row
         Write-Host ("  sentence {0,2}: seen {1}/{2} p50={3}ms p99={4}ms max={5}ms{6}" -f $n, $r.Lat.Count, $sentence.Length, $st.p50, $st.p99, $st.max, $note) -ForegroundColor $(if ($note -match "MISSING") { "Red" } else { "Gray" })
     }
+    $typing = Complete-PerfScenario $typingScn -Units $psmuxAll.Count
+    Write-Info (Format-PerfResourceLine (Get-PerfResourceSnapshot $roles) "after typing")
+    Write-Info ("cpu per 100 typed chars seen (includes the send-keys clears between sentences): " + (@($typing.cpu_ms_per_100_units.Keys | ForEach-Object { "{0} {1}ms" -f $_, $typing.cpu_ms_per_100_units[$_] }) -join "  "))
+    $script:TypingResources = [ordered]@{ at_prompt = (Get-PerfMemorySummary $resAtPrompt); typing = $typing }
     Add-PerfLoadSample "after_typing" | Out-Null
 
     # ── phase 2: Ctrl+C then type at once ───────────────────────────────
@@ -250,7 +276,7 @@ if ($cStats.n -ge [math]::Ceiling($CtrlCRepeats / 2) -and $cStats.p50 -le $MaxCt
     Write-Fail "first key after Ctrl+C: median $($cStats.p50)ms over $($cStats.n) presses > ${MaxCtrlCFirstMs}ms (the Ctrl+C router holds the server's input thread)"
 }
 
-$jsonPath = Write-PerfMetrics -Suite "test_typing_benchmark" -Binary $Binary -FileStem "typing-benchmark" -Data ([ordered]@{
+$jsonPath = Write-PerfMetrics -Suite $SuiteName -Binary $Binary -FileStem $MetricsStem -Data ([ordered]@{
     interval_ms           = $IntervalMs
     thresholds            = [ordered]@{ max_p99_ms = $MaxP99Ms; max_char_ms = $MaxCharMs; max_ctrlc_first_ms = $MaxCtrlCFirstMs }
     psmux_per_char        = $pStats
@@ -261,6 +287,7 @@ $jsonPath = Write-PerfMetrics -Suite "test_typing_benchmark" -Binary $Binary -Fi
     ctrlc_first_key_ms    = $ctrlcFirst
     direct_per_char       = $dStats
     direct_sentences      = $directRows
+    resources             = $script:TypingResources
     failed                = $script:TestsFailed
 })
 if ($jsonPath) { Write-Info "metrics: $jsonPath" }

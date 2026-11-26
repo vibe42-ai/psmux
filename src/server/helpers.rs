@@ -449,6 +449,7 @@ pub(crate) struct StatusFormats {
     pub window_status_current_style: String,
     pub mode_style: String,
     pub message_style: String,
+    pub message_command_style: String,
     pub client_render_options: ClientRenderOptions,
     /// Pre-built JSON array for the multi-line status bar.
     pub status_format_json: String,
@@ -565,6 +566,7 @@ pub(crate) fn expand_status_formats(
         window_status_current_style: expand_format(&app.window_status_current_style, app),
         mode_style: expand_format(&app.mode_style, app),
         message_style: expand_format(&app.message_style, app),
+        message_command_style: expand_format(&app.message_command_style, app),
         client_render_options: ClientRenderOptions {
             status_left_style: Some(expand_format(&app.status_left_style, app)),
             status_right_style: Some(expand_format(&app.status_right_style, app)),
@@ -608,6 +610,11 @@ pub(crate) fn expand_status_formats(
             } else {
                 Some(app.terminal_overrides.iter().map(|(_, entry)| entry.to_string()).collect())
             },
+            // Only travels when the user changed the option, so the default
+            // configuration adds nothing to every render frame.
+            terminal_features: crate::option_array::spec("terminal-features")
+                .filter(|spec| !app.terminal_features.holds_default(spec))
+                .map(|_| app.terminal_features.values()),
             word_separators: Some(app.word_separators.clone()),
             // Only the numbered elements: tmux reads user-keys by number from
             // 0 to KEYC_NUSER (tty-keys.c:533-540), so a named element is
@@ -622,6 +629,7 @@ pub(crate) fn expand_status_formats(
                     .collect();
                 (!keys.is_empty()).then_some(keys)
             },
+            status_keys_vi: (app.user_options.get("status-keys").map(String::as_str) == Some("vi")).then_some(true),
         },
         status_format_json: status_format_json(app),
         // set-titles-string was expanded outside the guard on BOTH paths, so it
@@ -760,6 +768,7 @@ pub(crate) fn window_name_check_due(
 
 pub(crate) fn combined_data_version(app: &AppState) -> u64 {
     let mut v = crate::program_status::version(app);
+    v = v.wrapping_add(((!app.host_events.is_empty()) as u64).wrapping_mul(0x7501_9001));
     fn walk(node: &Node, v: &mut u64) {
         match node {
             Node::Leaf(p) => {
@@ -832,12 +841,27 @@ pub(crate) fn combined_data_version(app: &AppState) -> u64 {
     // movement and scrolling in copy mode always invalidate the cached
     // frame.  Without this, keyboard navigation in copy mode produces
     // no visible change because the server returns NC (no change).
+    // The cursor and the anchor weigh every coordinate differently: with the
+    // columns added plain, `o` (other-end) swapping the two ends of a one row
+    // selection left the sum unchanged, the poll was answered NC and the
+    // cursor stayed drawn on the old end (disc694 section 7).
     if let Some((r, c)) = app.copy_pos {
-        v = v.wrapping_add((r as u64).wrapping_mul(0x10001).wrapping_add(c as u64));
+        v = v.wrapping_add((r as u64).wrapping_mul(0x10001).wrapping_add((c as u64).wrapping_mul(0x7F4A_7C15)));
     }
     v = v.wrapping_add((app.copy_scroll_offset as u64).wrapping_mul(0x20003));
+    // The selection's shape and the position indicator are drawn too: a
+    // V or a rectangle toggle that keeps both ends must not read as NC.
+    let shape: u64 = match app.copy_selection_mode {
+        crate::types::SelectionMode::Char => 0,
+        crate::types::SelectionMode::Line => 1,
+        crate::types::SelectionMode::Rect => 2,
+    };
+    v = v.wrapping_add(shape.wrapping_mul(0x6A09_E667_F3BC_C909));
+    if app.copy_hide_position {
+        v = v.wrapping_add(0xBB67_AE85_84CA_A73B);
+    }
     if let Some((ar, ac)) = app.copy_anchor {
-        v = v.wrapping_add((ar as u64).wrapping_mul(0x30007).wrapping_add(ac as u64));
+        v = v.wrapping_add((ar as u64).wrapping_mul(0x30007).wrapping_add((ac as u64).wrapping_mul(0x2545_F491_4F6C_DD1D)));
     }
     // Include status_message content so the search prompt refreshes per
     // keystroke while the user is typing in copy-mode search (#335).
@@ -889,6 +913,7 @@ fn alert_flags(win: &Window) -> (bool, bool, bool) {
 /// Also checks bell_pending on all panes and sets window bell_flag,
 /// and checks monitor-silence timeout to set silence_flag.
 pub(crate) fn check_window_activity(app: &mut AppState) -> WindowAlerts {
+    drain_host_events(app);
     let active = app.active_idx;
     let bell_action = app.bell_action.clone();
     let mut triggered_hooks: Vec<&'static str> = Vec::new();
@@ -1010,14 +1035,16 @@ pub(crate) fn propagate_osc_titles(app: &mut AppState) -> bool {
 /// Returns `Some((state, value))` when a progress sequence has been received,
 /// where state ∈ 0..=4 (0=hide, 1=default, 2=error, 3=indeterminate, 4=warning)
 /// and value ∈ 0..=100. Used by the dump-state builder so the client can
-/// re-emit OSC 9;4 to the host terminal (issue #269).
+/// re-emit OSC 9;4 to the host terminal (issue #269). `None` reaches the client
+/// as no field, which it reads as hidden.
+///
+/// From the live parser, as tmux reads `wp->base` (server-client.c:2666 at tag
+/// 3.8), so copy mode does not freeze it, and a dead pane keeps its value until
+/// a respawn, also measured from tmux 3.8.
 pub(crate) fn active_pane_progress(app: &AppState) -> Option<(u8, u8)> {
     let win = app.windows.get(app.active_idx)?;
     let pane = crate::tree::active_pane(&win.root, &win.active_path)?;
-    if pane.dead {
-        return None;
-    }
-    let parser = pane.term.lock().ok()?;
+    let parser = pane.live_parser().lock().ok()?;
     parser.screen().progress()
 }
 
@@ -1258,10 +1285,63 @@ pub(crate) fn drain_osc52(app: &mut AppState) {
     app.clipboard_osc52 = Some(text);
 }
 
+/// Drain on each activity tick, including hidden panes and detached sessions,
+/// so a later window switch or attach cannot replay events emitted unseen.
+/// Only enabled tmux passthrough bodies are queued, so with
+/// `allow-passthrough off` this is one atomic load and locks no pane.
+pub(crate) fn drain_host_events(app: &mut AppState) {
+    if !vt100::host_events_pending() {
+        if !app.host_events.host_events.is_empty()
+            && !app.client_registry.values().any(|client| !client.is_control)
+        {
+            app.host_events = Default::default();
+        }
+        return;
+    }
+    fn pane(p: &crate::types::Pane, visible: bool, mode: &str, attached: bool, out: &mut crate::frame_oneshot::OneShots) {
+        let term = p.live_term.as_ref().unwrap_or(&p.term);
+        if let Ok(mut parser) = term.lock() {
+            for event in parser.screen_mut().take_host_events() {
+                // tmux writes a passthrough only for `on` (visible panes) and
+                // `all` (any pane); nothing else reaches the host terminal.
+                if attached && event.passthrough && (mode == "all" || (mode == "on" && visible)) {
+                    out.host_raw |= event.passthrough;
+                    out.push_host_event(event.bytes);
+                }
+            }
+        }
+    }
+    fn walk(node: &Node, visible: bool, zoom: Option<usize>, mode: &str, attached: bool, out: &mut crate::frame_oneshot::OneShots) {
+        match node {
+            Node::Leaf(p) => pane(p, visible && zoom.map_or(true, |id| id == p.id), mode, attached, out),
+            Node::Split { children, .. } => for child in children { walk(child, visible, zoom, mode, attached, out); },
+        }
+    }
+    let attached = app.client_registry.values().any(|client| !client.is_control);
+    let mut events = std::mem::take(&mut app.host_events);
+    if !attached { events = Default::default(); }
+    for (i, win) in app.windows.iter().enumerate() {
+        let visible = i == app.active_idx;
+        let zoom = if win.zoom_saved.is_some() { crate::tree::active_pane(&win.root, &win.active_path).map(|p| p.id) } else { None };
+        walk(&win.root, visible, zoom, &app.allow_passthrough, attached, &mut events);
+        for float in &win.floating {
+            pane(&float.pane, visible, &app.allow_passthrough, attached, &mut events);
+        }
+    }
+    if let crate::types::Mode::PopupMode { popup_pane: Some(p), .. } = &app.mode {
+        pane(p, true, &app.allow_passthrough, attached, &mut events);
+    }
+    app.host_events = events;
+}
+
 /// The clipboard write and bell staged for the next frame, taken so they go
 /// out once.
 pub(crate) fn take_frame_oneshots(app: &mut AppState) -> crate::frame_oneshot::OneShots {
+    drain_host_events(app);
+    let host = std::mem::take(&mut app.host_events);
     crate::frame_oneshot::OneShots {
+        host_events: host.host_events,
+        host_raw: host.host_raw,
         clip_b64: app.clipboard_osc52.take().map(|t| crate::util::base64_encode(&t)),
         bell: std::mem::take(&mut app.bell_forward),
         // Last in the frame with the clipboard and bell, so a frame that
@@ -1590,10 +1670,20 @@ pub(crate) fn background_reply(colors: &crate::types::HostColors, bel: bool) -> 
     colors.bg.map(|rgb| format!("\x1b]11;{}{}", x11_rgb(rgb), osc_end(bel)))
 }
 
+/// The reply to `OSC n ; ?` (10 or 11) with a colour of the pane's own,
+/// ended as [`foreground_reply`] is.
+pub(crate) fn pane_colour_reply(n: u8, rgb: (u8, u8, u8), bel: bool) -> String {
+    format!("\x1b]{n};{}{}", x11_rgb(rgb), osc_end(bel))
+}
+
 /// The `OSC 4` reply for palette index `i`, ended as [`foreground_reply`] is.
 /// The pane's own entry (`own`) wins, the outer terminal's is the fallback
-/// (issue #685); the client reports only the sixteen ANSI colours of the
-/// outer terminal, so a higher index has a reply only from `own`.
+/// (issue #685). The client reports only the sixteen ANSI colours of the
+/// outer terminal, so an index of 16 or more with no entry is answered from
+/// the xterm 256 colour table (#1018). tmux asks the outer terminal for it
+/// (input_add_request, input.c:2955) and gives no reply when no client can be
+/// asked or none answers in 500 ms; nearly every terminal answers with this
+/// same table, and answering from it never holds the pane's later replies.
 pub(crate) fn palette_reply(
     i: usize,
     colors: &crate::types::HostColors,
@@ -1601,6 +1691,7 @@ pub(crate) fn palette_reply(
     bel: bool,
 ) -> Option<String> {
     own.or_else(|| colors.palette.get(i).copied().flatten())
+        .or_else(|| u8::try_from(i).ok().filter(|&n| n >= 16).map(vt100::xterm_rgb))
         .map(|rgb| format!("\x1b]4;{};{}{}", i, x11_rgb(rgb), osc_end(bel)))
 }
 
@@ -1623,7 +1714,8 @@ pub(crate) fn drain_color_queries(node: &mut crate::types::Node, colors: &crate:
     }
 }
 
-/// Complete list of supported tmux-compatible commands (for list-commands).
+/// The tmux-compatible command names and aliases, for validating a command
+/// name (list-commands prints crate::list_commands::COMMAND_TABLE instead).
 pub(crate) const TMUX_COMMANDS: &[&str] = &[
     "attach-session (attach)",
     "bind-key (bind)",
@@ -1899,3 +1991,7 @@ mod test_cli_command_prompt_client;
 #[cfg(test)]
 #[path = "../../tests-rs/test_stale_confirm.rs"]
 mod test_stale_confirm;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_disc694_other_end_frame.rs"]
+mod test_disc694_other_end_frame;

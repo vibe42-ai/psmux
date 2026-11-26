@@ -252,6 +252,14 @@ Multi-byte UTF-8 characters (box-drawing, emoji, CJK text) render correctly in p
 
 Emoji clusters take the columns tmux gives them (#749). A ZWJ sequence such as a family, an emoji with a skin tone modifier, a flag spelled with two regional indicators, and a character followed by the variation selector U+FE0F each occupy one cell two columns wide, so `U+1F468 ZWJ U+1F469 ZWJ U+1F467 ZWJ U+1F466` moves the cursor two columns, not eight. The rules are tmux's `utf8_should_combine` (utf8-combined.c) and `screen_write_combine` (screen-write.c), including tmux's 32 byte limit on one cell, and command prompts count columns with the same rule. Windows Terminal, VS Code, JetBrains, WezTerm, Alacritty, ConEmu and conhost draw these sequences as one glyph too; mintty is the known outlier and draws the parts separately.
 
+### Background Colour Erase
+
+What a pane's program erases or moves away is left blank in the current background colour, with no foreground, underline, reverse or link, as in tmux: a line scrolled in by a line feed (LF, `ESC D`, `ESC E`) at the bottom of the scroll region, by `ESC M` at its top, or by `ESC [ n S` and `ESC [ n T`, lines inserted or deleted with `ESC [ n L` and `ESC [ n M`, characters inserted or deleted with `ESC [ n @` and `ESC [ n P`, and the erases `ESC [ J`, `ESC [ K` and `ESC [ n X`. So `ESC [ 4 m ESC [ K` leaves no underline across the rest of the line.
+
+One place follows the console hosts, which agree with each other, rather than tmux: when text wraps at the bottom of the scroll region, the line scrolled in takes the current background. tmux leaves that line in the default colours.
+
+The inbox conhost does all of this itself and hands psmux the result. Through OpenConsole (`PSMUX_CONPTY_DIR`) psmux reads the sequences.
+
 ### Window-scoped Options
 
 Every window carries its own option table, so a window-scoped write reaches one window and nothing else (#648, from the #647 WIN-01 report):
@@ -323,6 +331,34 @@ Two things follow tmux by not changing. `list-panes`, `list-windows` and `list-s
 
 One deliberate deviation: a backslash is never doubled. tmux stores `C:\src` as `C:\\src`, which on Windows would corrupt every path shaped window name.
 
+### Cursor Colour (OSC 12)
+
+A pane's cursor colour is the one its program set with `ESC ] 12 ; colour`, until `ESC ] 112` takes it back, and otherwise the `cursor-colour` option, as tmux keeps `s->ccolour` over `s->default_ccolour`. RIS and the alternate screen keep it, as in tmux. `ESC ] 12 ; ?` is answered with that colour as `ESC ] 12 ; rgb:rrrr/gggg/bbbb`, ended the way the query was, and with neither there is no reply, as in tmux. The client sends the active pane's colour to the terminal, and the terminal's own back on the way out.
+
+Two limits:
+
+- The inbox conhost passes on the colour a program sets but drops `ESC ] 112` and the query, so on that console host a program's colour is not taken, as it would stay after the program had gone. `cursor-colour` works there. Through OpenConsole (`PSMUX_CONPTY_DIR`) all three arrive.
+- A program's colour is read as `#rrggbb`, `rgb:rr/gg/bb`, `rgb:rrrr/gggg/bbbb` or `r,g,b`, as for `ESC ] 4`. tmux also takes X11 names such as `orange` and `cmyk:` forms; psmux has no table of the names, so those are ignored.
+
+### Default Colours (OSC 10 and OSC 11)
+
+A pane's default foreground and background are the ones its program set with `ESC ] 10 ; colour` and `ESC ] 11 ; colour`, until `ESC ] 110` or `ESC ] 111` takes them back, as tmux keeps them in the pane's palette. RIS, a bare `ESC ] 104` and `send-keys -R` take them back too, as they clear that palette, and a respawn, `clear-history` and the alternate screen keep them. The client draws the pane's cells in the default colours with them, in tmux's order with the window styles (`tty_default_colours`):
+
+| Pane | Its default colour |
+|---|---|
+| The active pane | `window-active-style`'s, then the program's, then `window-style`'s |
+| Any other pane | `window-style`'s, then the program's |
+
+So the program's colour beats `window-style` in the active pane and loses to it in the others. `ESC ] 10 ; ?` and `ESC ] 11 ; ?` are answered with the same colour as `ESC ] 10 ; rgb:rrrr/gggg/bbbb`, ended the way the query was, and with none of them with the outer terminal's colour, as before. A float's `new-pane -s` style counts as both of its window styles.
+
+Three differences:
+
+- The inbox conhost passes on the colours a program sets but drops a bare `ESC ] 110` and `ESC ] 111`, so on that console host a program's colours are not taken, as for the cursor colour, and a query is answered from the window styles or the outer terminal. The inbox conhost of build 26300 drops the queries too, so no reply comes there; the Windows 10 one (build 19045) passes them on when it next draws. Through OpenConsole (`PSMUX_CONPTY_DIR`) all of them arrive.
+- psmux keeps `window-style` and `window-active-style` only as global options (`set -w` sets the global value and `set -p` is refused), so the replies use those, as the drawing does. tmux uses a window's or a pane's own value.
+- tmux clears the colours on RIS and `ESC ] 104` but goes on drawing and answering with the old ones until the pane's style next changes, as it keeps them in a cache. psmux takes them back at once.
+
+A program's colour is read as for the cursor colour, so X11 names are ignored.
+
 ### Git Revision in `psmux -V`
 
 `psmux -V` reports the commit the binary was built from. `git` is the preferred source, and when it is unavailable the build falls back, in order, to `.cargo_vcs_info.json` (present in every crates.io tarball), to the cargo git checkout directory name (`cargo install --git` checks a revision out into a directory named after its short hash), and finally to a `PSMUX_GIT_SHA` environment variable that release tooling can set (#647):
@@ -350,7 +386,7 @@ ESC]104 ESC\                   put every index back
 ESC]4;4;? ESC\                 answered from this pane's entry, then from the host terminal
 ```
 
-A query for any index from 0 to 255 is answered from the pane's entry, set by OSC 4 or by `pane-colours`, as tmux answers it from `colour_palette_get`. With no entry, the sixteen ANSI colours are answered from the host terminal, whose values the client reports; tmux also asks the host terminal for the other indexes, which psmux does not do yet, so they go unanswered. Each reply ends the way its query did, BEL or ST, as tmux's `input_osc_colour_reply` ends it, and so do the OSC 10 and OSC 11 replies.
+A query for any index from 0 to 255 is answered from the pane's entry, set by OSC 4 or by `pane-colours`, as tmux answers it from `colour_palette_get`. With no entry, the sixteen ANSI colours are answered from the host terminal, whose values the client reports, and any index from 16 to 255 from the xterm 256 colour table (the 6x6x6 cube of 0, 95, 135, 175, 215 and 255, then 24 greys from 8 in steps of 10). This is a deliberate difference: tmux asks the host terminal for those indexes (`input_add_request`), holds the pane's later replies (DA1 and the rest) until the answer comes, and gives no reply at all when no client is attached or none answers within 500 ms. Nearly every terminal, Windows Terminal included, answers with the xterm table, so the colour is the same in practice, and psmux never makes a pane wait for it, detached or nested. Each reply ends the way its query did, BEL or ST, as tmux's `input_osc_colour_reply` ends it, and so do the OSC 10 and OSC 11 replies.
 
 This matters most for Windows console applications. A pane child on ConPTY announces its console colour table as OSC 4 and then paints with indexed SGR rather than true colour, so Far Manager's panels are `ESC[48;5;4m` against an OSC 4 that says index 4 is `#000080`. Before #685 psmux dropped the palette and re rendered the cell as a plain `ESC[44m`, which Windows Terminal painted with its own Campbell `#0037DA`. Far inside psmux now paints `#000080`, `#008080` and `#00FFFF` exactly as Far outside psmux does.
 
@@ -362,9 +398,106 @@ Three deliberate choices:
 
 One platform limit, measured on Windows 11 build 26200: conhost swallows a **bare** `ESC]104 ESC\` on the ConPTY output path, so a pane child running under ConPTY cannot reach the clear-everything form. `ESC]104;4 ESC\` arrives normally.
 
+### Scroll Region, Origin Mode and DECALN
+
+A pane's scroll region and origin mode are what `#{scroll_region_upper}`, `#{scroll_region_lower}` and `#{origin_flag}` show:
+
+| Sequence | Effect |
+|---|---|
+| `ESC [ top ; bottom r` (DECSTBM) | Sets the region and moves the cursor home: the top left of the screen, or of the region in origin mode. A missing or 0 bottom is the last row and a missing or 0 top the first, so `ESC [ r` and `ESC [ 0 ; 0 r` give the whole screen. A region of one line or less, or with its bottom past the screen, is ignored and the cursor stays |
+| `ESC [ ? 6 h` / `l` (DECOM) | Origin mode on or off, the cursor home either way |
+| `ESC [ row d` (VPA) | To `row`, counted from the top of the region in origin mode and stopping at its bottom, keeping the column |
+| `ESC # 8` (DECALN) | Fills the screen with `E` in the default colours, puts the region back to the whole screen, turns origin mode off and moves the cursor to the top left. The colours for text written after it are unchanged |
+
+Four of these follow the console hosts, which agree with each other, rather than tmux, so that psmux's screen stays where the host's is: tmux homes DECSTBM to the top left of the screen in origin mode, cuts a bottom past the screen to the last row, ignores `ESC [ 0 ; 0 r` as a one line region, and keeps origin mode across DECALN.
+
+The inbox conhost keeps the region and origin mode to itself and hands psmux the result, so the cursor and the screen are right there, and the three formats show the whole screen and `0`. Through OpenConsole (`PSMUX_CONPTY_DIR`) psmux reads the sequences, and the formats follow the program.
+
+### Sixel Limits Query (XTSMGRAPHICS)
+
+`CSI ? item ; action ; value S` asks a terminal for its sixel limits. psmux answers it itself and does not ask the outer terminal, as tmux's `input_csi_dispatch_sm_graphics` does not. Which answer a pane gets follows what its programs were told by DA1:
+
+| Pane's console host | DA1 reply | Colour registers (item 1, read, reset or maximum) | Anything else |
+|---|---|---|---|
+| OpenConsole (`PSMUX_CONPTY_DIR`) | psmux's, `CSI ? 1;2;4 c`, listing sixel | `CSI ? 1;0;1024 S`, as tmux | `CSI ? item;3;value S`, failure, as tmux |
+| Inbox conhost | its own, not listing sixel | `CSI ? 1;3;value S`, failure | `CSI ? item;3;value S`, failure |
+
+The inbox conhost differs from tmux on purpose: it drops a pane's sixel before psmux sees it, so reporting colour registers there would describe images nothing can draw. A query with more than three parameters gets no reply, as in tmux. psmux reads a parameter as at most 65535, where tmux reads up to `INT_MAX`.
+
+### Tab Stops (HTS, TBC, CBT, HPA)
+
+Each pane keeps a table of tab stops, every 8 columns to begin with, which `#{pane_tabs}` lists, as tmux keeps `s->tabs`:
+
+| Sequence | Effect |
+|---|---|
+| `HT` (tab) | To the next stop, or the last column when there is none. Nothing from the last column |
+| `ESC H` (HTS) | A stop at the cursor, unless it waits past the last column |
+| `ESC [ g` or `ESC [ 0 g` (TBC) | Clears the stop at the cursor. `ESC [ 3 g` clears them all, and any other value nothing |
+| `ESC [ n Z` (CBT) | Back `n` stops (0 counts as 1), or to column 0 |
+| ``ESC [ n ` `` (HPA) | To column `n`, the same as `ESC [ n G` |
+
+The normal and the alternate screen share the table. A change of width, RIS, `send-keys -R` and a respawn put the default back, and a change of height alone keeps it.
+
+The inbox conhost keeps a table of its own and hands psmux plain cursor moves instead of these sequences, so the cursor lands where it should there too, but `#{pane_tabs}` stays at the default. Through OpenConsole (`PSMUX_CONPTY_DIR`) psmux reads them, and the table follows the program.
+
+### Progress Indicator (OSC 9;4)
+
+A pane sets the progress indicator with `ESC]9;4;state;value ESC\`. Each pane keeps its own, `#{pane_pb_state}` (`hidden`, `normal`, `error`, `indeterminate` or `paused`) and `#{pane_pb_progress}` read it, and the client writes the active pane's to the host terminal when it changes. The fields are read as tmux's `input_osc_9` reads them:
+
+```
+ESC]9;4;1;50 ESC\              state and value
+ESC]9;4;3 ESC\                 state only (a trailing ; is the same), the value stays
+ESC]9;4;3;70 ESC\              indeterminate never takes a value, the value stays
+```
+
+The state is one digit, 0 hidden, 1 normal, 2 error, 3 indeterminate, 4 paused. The value is at most 100. Anything else leaves the indicator as it was. The client always writes both fields, so `ESC]9;4;3 ESC\` after a value of 50 reaches the host terminal as `ESC]9;4;3;50 ESC\`, as it does from tmux. RIS leaves the indicator alone, copy mode does not stop it, a dead pane keeps it, and a respawn clears it. A pane that never set one reads as `hidden` and `0`, so switching to it writes `ESC]9;4;0;0 ESC\`. A detach writes nothing, as in tmux, so the host terminal keeps showing what it last got.
+
+What the client writes is the `Spb` capability, which the `progressbar` feature of `terminal-features` gives it:
+
+| Config | The client writes |
+|---|---|
+| The default | `ESC]9;4;state;value ESC\` |
+| `set -as terminal-features '*:progressbar@'` | Nothing. A later `*:progressbar` does not bring it back |
+| `set -g terminal-features 'xterm*:title'` | Nothing, since that list no longer has the feature |
+| `set -as terminal-overrides '*:Spb@'` | Nothing, though `#{client_termfeatures}` still lists the feature |
+| `set -as terminal-overrides '*:Spb=\E]9;4;%p1%d;%p2%d\a'` | The same ending in BEL, with or without the feature |
+
+Three things differ from tmux:
+
+- `terminal-features` holds one more element, `*:progressbar`. tmux turns the feature on for the terminals it identifies, which do not include Windows Terminal, so there it has to be added by hand. psmux does not ask the terminal which one it is, so it starts on for all of them.
+- An option set while a client is attached counts from the next write. tmux reads both at attach.
+- `Spb` is expanded for `%p1`, `%p2`, `%d` and `%%`. A value with any other terminfo operator writes nothing, and so does a value that does not use `%p2`, which is also what tmux does for that one.
+
+### Clipboard Read (OSC 52 ; ?)
+
+A pane program asks for the clipboard with `ESC ] 52 ; c ; ? ESC \`. As in tmux, the query is read only with `set-clipboard on`; with `external`, the default, or `off`, it gets no reply, so nothing a program prints can read back what you copied unless you turn this on. With `on`, psmux answers as the `get-clipboard` server option says, as tmux's `input_osc_52_reply` does:
+
+| `get-clipboard` | The reply |
+|---|---|
+| `off` | none |
+| `buffer` (the default) | the newest automatic paste buffer, none without one; a named buffer (`set-buffer -b`) is not read |
+| `request` | the Windows clipboard's text, as `refresh-client -l` reads it, where tmux asks the terminal of the most recently used client; none with no client attached, as in tmux |
+| `both` | the same, kept as a new paste buffer too |
+
+The reply is `ESC ] 52 ; selection ; base64 data`, ended the way the query was, and names the first selection character tmux knows (`cpqs01234567`) that the query gave, or none. A clipboard write earlier in the same output is read back on `set-clipboard on`, where it makes a buffer. When another window holds the Windows clipboard open, `request` and `both` wait for it for up to a second, as a paste does, and the pane's other replies wait behind it, while other panes go on; past that the query gets no reply. tmux waits up to 5 seconds for its terminal's answer. `request` and `both` let any pane program read what you copied, so leave them off unless you want that.
+
+One difference:
+
+- **Not through the inbox conhost of Windows 11.** It drops the query before psmux sees it (builds 26200 and 26300), so a pane there gets no reply whatever the options. The Windows 10 one (build 19045) passes it on when it next draws, and OpenConsole (`PSMUX_CONPTY_DIR`) passes it on.
+
 ## Behavioral Differences from tmux
 
 A few commands intentionally behave differently from upstream tmux. These are deliberate choices, not bugs.
+
+### `allow-passthrough`
+
+A program that sees `TMUX` set may wrap a sequence meant for the outer terminal in a tmux passthrough, `ESC P tmux; ... ESC \`, with every inner ESC doubled. Claude Code does this for its OSC 52 copy, after writing the same copy unwrapped.
+
+- **`off` (the default) matches tmux.** The whole passthrough is dropped and nothing inside it is acted on, as in tmux (`input_dcs_dispatch`, input.c:2672). A wrapped OSC 52 does not copy, a wrapped title or clear screen does not apply. An unwrapped OSC 52 still copies under the `set-clipboard` rules.
+- **`on` and `all` forward the unescaped body raw to attached terminals.** `on` forwards from visible panes in the active window (respecting zoom), `all` from any pane of the session. The pane screen never interprets the body. Delivery is consume-once and survives frame coalescing; raw writes invalidate the client screen cache. A pane's own unwrapped notification OSCs (OSC 9, 99, 777, 9001) are never forwarded, as in tmux: wrap them in a passthrough. See [design/allow-passthrough-forwarding.md](design/allow-passthrough-forwarding.md) for bounds.
+- psmux keeps the option per server, not per window or pane as tmux does, and a change with `set -g allow-passthrough` applies to panes that already exist.
+- The inbox Windows console host can consume ST-terminated wrappers or unwrap their contents before psmux receives them. BEL-terminated OSC wrappers can arrive with their closing `ESC \` missing (#1026). psmux ends such a passthrough at the program's next escape sequence, or at text that follows the wrapped sequence's BEL, so the output after it is never swallowed. A passthrough still open after 5 seconds is ended at the next output, as tmux's parser returns to ground after 5 seconds.
+- Control mode clients (`-CC`) get the wrapped sequence unwrapped in `%output` whatever the option says (#1026), since a control client is the outer terminal.
 
 ### `kill-server` with Multiple Sockets
 

@@ -17,8 +17,7 @@ static INPUT_BUFFER_SIZE: std::sync::atomic::AtomicUsize =
 /// Record the `input-buffer-size` server option for every pane parser in this
 /// process, as tmux's `input_set_buffer_size` (input.c) does.
 ///
-/// Only a sixel DCS is held to it here; tmux also holds OSC and APC strings
-/// to it.
+/// Sixel and collected tmux passthrough bodies honor it.
 pub fn set_input_buffer_size(bytes: usize) {
     INPUT_BUFFER_SIZE.store(bytes, std::sync::atomic::Ordering::Relaxed);
 }
@@ -29,9 +28,111 @@ pub fn input_buffer_size() -> usize {
     INPUT_BUFFER_SIZE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether `allow-passthrough` is `on` or `all`. Off (the default, as in
+/// tmux) drops the body of a `DCS tmux;` passthrough unparsed, as tmux does
+/// (input.c:2672-2674). On, exact unescaped bodies are queued for the host
+/// terminal without changing the pane screen. The server applies on/all
+/// visibility when draining the queue. One
+/// per process, like `input-buffer-size`, so a change applies to every pane
+/// at once.
+static ALLOW_PASSTHROUGH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Record the `allow-passthrough` server option for every pane parser in this
+/// process: `true` for `on` and `all`, `false` for `off`.
+pub fn set_allow_passthrough(on: bool) {
+    ALLOW_PASSTHROUGH.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The value last given to [`set_allow_passthrough`].
+#[must_use]
+pub fn allow_passthrough() -> bool {
+    ALLOW_PASSTHROUGH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether parsers made from now on read the stream the way the inbox Windows
+/// console host writes it, where a C0 control outside an escape sequence is a
+/// buffer cell holding that control and takes one column (see
+/// [`conhost_c0_glyph`]). psmux turns it on in a server whose panes run under
+/// the inbox conhost. A supplied OpenConsole forwards the application's own
+/// bytes, where a tab is a tab, so it stays off there; off is also the
+/// default, which is plain VT.
+static CONHOST_C0_CELLS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set the [`CONHOST_C0_CELLS`] default for parsers created after this call.
+pub fn set_conhost_c0_cells_default(on: bool) {
+    CONHOST_C0_CELLS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The value last given to [`set_conhost_c0_cells_default`].
+#[must_use]
+pub fn conhost_c0_cells_default() -> bool {
+    CONHOST_C0_CELLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether parsers made from now on read the stream the way the inbox console
+/// host of Windows 10 (before build 22000, measured on 19045) writes it, on
+/// top of [`CONHOST_C0_CELLS`]. That host keeps a C1 control a program wrote
+/// as UTF-8 (`C2 85`, U+0085) as a buffer cell of one column and hands it to
+/// psmux as written, so the cell is kept here as U+FFFD (written as itself,
+/// U+0085 would be a NEL to the outer terminal); the newer hosts keep no cell
+/// and send nothing. It also hides and shows its cursor with `CSI 25 l` and
+/// `CSI 25 h`, the `?` left out, which are read here as DECTCEM. psmux turns
+/// it on in a server whose panes run under that host; off is the default.
+static CONHOST_WIN10: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set the [`CONHOST_WIN10`] default for parsers created after this call.
+pub fn set_conhost_win10_default(on: bool) {
+    CONHOST_WIN10.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The value last given to [`set_conhost_win10_default`].
+#[must_use]
+pub fn conhost_win10_default() -> bool {
+    CONHOST_WIN10.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The glyph for a C0 control the inbox conhost sent as a cell, or `None` for
+/// the controls it sends as controls.
+///
+/// A console cell can hold a C0 control (WriteConsoleOutputCharacterW puts one
+/// there, and so does a write while ENABLE_PROCESSED_OUTPUT is off). The inbox
+/// conhost (Windows 10 19045 and Windows 11 26100, with or without the
+/// passthrough flag) writes such a cell to the pipe as the bare byte and counts
+/// it as one column, so its next relative move, a BS to step back onto the
+/// cell, lands one column short in a terminal that runs the byte as a control
+/// (#972, the stale first letter in Claude Code's prompt). With processed
+/// output on it sends the code page 437 picture instead (SI as ☼), and so does
+/// a NuGet OpenConsole for the same cell; this is that picture.
+///
+/// BEL, BS, LF, CR and ESC stay controls: conhost uses them itself (BEL for a
+/// real bell, after which it does not move its cursor). NUL and DEL never
+/// reach `execute`.
+pub(crate) fn conhost_c0_glyph(b: u8) -> Option<char> {
+    const CP437: [char; 32] = [
+        '\0', '\u{263a}', '\u{263b}', '\u{2665}', '\u{2666}', '\u{2663}', '\u{2660}', '\u{2022}',
+        '\u{25d8}', '\u{25cb}', '\u{25d9}', '\u{2642}', '\u{2640}', '\u{266a}', '\u{266b}',
+        '\u{263c}', '\u{25ba}', '\u{25c4}', '\u{2195}', '\u{203c}', '\u{00b6}', '\u{00a7}',
+        '\u{25ac}', '\u{21a8}', '\u{2191}', '\u{2193}', '\u{2192}', '\u{2190}', '\u{221f}',
+        '\u{2194}', '\u{25b2}', '\u{25bc}',
+    ];
+    match b {
+        0x00 | 0x07 | 0x08 | 0x0a | 0x0d | 0x1b => None,
+        0x01..=0x1f => Some(CP437[b as usize]),
+        _ => None,
+    }
+}
+
 pub struct WrappedScreen<CB: crate::callbacks::Callbacks = ()> {
     pub screen: crate::screen::Screen,
     pub callbacks: CB,
+    /// Read C0 controls as conhost cells; see [`CONHOST_C0_CELLS`].
+    pub(crate) conhost_c0_cells: bool,
+    /// Read the Windows 10 inbox conhost's C1 cells and `CSI 25 h` / `l`;
+    /// see [`CONHOST_WIN10`].
+    pub(crate) conhost_win10: bool,
     /// Set by `hook` when a sixel DCS (final `q`, no intermediates) begins, so
     /// `put`/`unhook` know to accumulate and materialise the image.  Any other
     /// DCS leaves this `false`, preserving the pre-existing no-op behaviour.
@@ -46,7 +147,17 @@ pub struct WrappedScreen<CB: crate::callbacks::Callbacks = ()> {
     /// and the dispatchers' ends, :1383, :1459, :1895, :2549, :2694 at tag
     /// 3.8).
     last_printed: Option<char>,
+    /// How much of `tmux;` a DCS has matched: 1 after the final `t`, 5 once
+    /// `mux;` followed, which stops vte (`terminated`) so the parser can skip
+    /// the passthrough body (see `passthrough`). 0 otherwise.
+    tmux_prefix: u8,
+    /// How much of a `tmux;` the inbox conhost painted from a DCS it could
+    /// not parse has been skipped, or `None`; see `arm_conhost_dcs_body`.
+    conhost_dcs_body: Option<u8>,
 }
+
+/// What the Windows 10 inbox conhost prints of `ESC P tmux; ESC ...`.
+const CONHOST_DCS_BODY: &[u8] = b"tmux;";
 
 impl WrappedScreen<()> {
     pub fn new(rows: u16, cols: u16, scrollback_len: usize) -> Self {
@@ -67,9 +178,13 @@ impl<CB: crate::callbacks::Callbacks> WrappedScreen<CB> {
                 scrollback_len,
             ),
             callbacks,
+            conhost_c0_cells: conhost_c0_cells_default(),
+            conhost_win10: conhost_win10_default(),
             dcs_active: false,
             dcs_buf: Vec::new(),
             last_printed: None,
+            tmux_prefix: 0,
+            conhost_dcs_body: None,
         }
     }
 
@@ -79,15 +194,80 @@ impl<CB: crate::callbacks::Callbacks> WrappedScreen<CB> {
         Self {
             screen,
             callbacks,
+            conhost_c0_cells: conhost_c0_cells_default(),
+            conhost_win10: conhost_win10_default(),
             dcs_active: false,
             dcs_buf: Vec::new(),
             last_printed: None,
+            tmux_prefix: 0,
+            conhost_dcs_body: None,
         }
+    }
+}
+
+impl<CB: crate::callbacks::Callbacks> WrappedScreen<CB> {
+    /// A DCS ended in `t` and may still be matching `mux;`.
+    pub(crate) fn tmux_prefix_pending(&self) -> bool {
+        (1..5).contains(&self.tmux_prefix)
+    }
+
+    /// True once, right after a DCS turned out to be `ESC P tmux;`.
+    pub(crate) fn take_tmux_passthrough(&mut self) -> bool {
+        let matched = self.tmux_prefix == 5;
+        if matched {
+            self.tmux_prefix = 0;
+        }
+        matched
+    }
+
+    /// The inbox conhost just forwarded a sequence that began with two
+    /// escapes, which only a tmux passthrough it could not parse produces.
+    ///
+    /// The conhost of Windows 10 (19045) has no DCS parser. For an
+    /// application's `ESC P tmux; ESC ESC ] 11;? BEL ESC \` (Claude Code
+    /// wraps its queries so under TMUX) it ignores `ESC P`, prints `tmux;`
+    /// into its buffer at the cursor, and forwards the inner OSC with both
+    /// escapes. Its next frame then paints the five cells (issue #972).
+    ///
+    /// The application never wrote that text, and tmux drops the whole DCS
+    /// while allow-passthrough is off (input_dcs_dispatch), so when the next
+    /// text is exactly `tmux;` psmux keeps the cells the application drew and
+    /// only moves the cursor past them, the way conhost counted them. Any
+    /// other text spends the mark and is drawn as usual.
+    pub(crate) fn arm_conhost_dcs_body(&mut self) {
+        self.conhost_dcs_body = Some(0);
+    }
+
+    /// Skip `c` if it continues the `tmux;` conhost painted; see
+    /// [`arm_conhost_dcs_body`](Self::arm_conhost_dcs_body).
+    fn skip_conhost_dcs_body(&mut self, c: char) -> bool {
+        let Some(done) = self.conhost_dcs_body.take() else {
+            return false;
+        };
+        let done = usize::from(done);
+        if u32::from(c) == u32::from(CONHOST_DCS_BODY[done]) {
+            self.screen.cuf(1);
+            if done + 1 < CONHOST_DCS_BODY.len() {
+                self.conhost_dcs_body = Some((done + 1) as u8);
+            }
+            return true;
+        }
+        // Not that body after all: draw what was skipped.
+        if done > 0 {
+            self.screen.cub(done as u16);
+            for &b in &CONHOST_DCS_BODY[..done] {
+                self.screen.text(char::from(b));
+            }
+        }
+        false
     }
 }
 
 impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
     fn print(&mut self, c: char) {
+        if self.conhost_dcs_body.is_some() && self.skip_conhost_dcs_body(c) {
+            return;
+        }
         // U+FFFD is a character of one cell, as in tmux, which writes it for
         // a byte that is no UTF-8 (input.c:783-793 at tag 3.8,
         // input_stop_utf8). The console hosts hand psmux the same: a lone
@@ -99,8 +279,15 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
         // cell at all. vte hands them, encoded or as a lone byte, to
         // `execute`, which ignores them too; only an encoded one split across
         // two reads reaches here (vte's advance_partial_utf8).
+        //
+        // The Windows 10 inbox conhost keeps one as a cell, though; see
+        // [`CONHOST_WIN10`].
         if ('\u{80}'..'\u{a0}').contains(&c) {
-            self.callbacks.unhandled_char(&mut self.screen, c);
+            if self.conhost_win10 {
+                self.print('\u{fffd}');
+            } else {
+                self.callbacks.unhandled_char(&mut self.screen, c);
+            }
         } else {
             // The line drawing set turns `q` into `─` here; REP repeats the
             // letter, so the set in use when it repeats applies, as in tmux
@@ -111,6 +298,18 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
     }
 
     fn execute(&mut self, b: u8) {
+        // A C1 control as UTF-8 reaches here as its byte; the Windows 10 inbox
+        // conhost hands one over only for a cell it keeps ([`CONHOST_WIN10`]).
+        if self.conhost_win10 && (0x80..=0x9f).contains(&b) {
+            self.print('\u{fffd}');
+            return;
+        }
+        if self.conhost_c0_cells {
+            if let Some(glyph) = conhost_c0_glyph(b) {
+                self.print(glyph);
+                return;
+            }
+        }
         self.last_printed = None;
         match b {
             7 => {
@@ -140,6 +339,11 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
             self.screen.designate_charset(*g == b')', b == b'0');
             return;
         }
+        // DECALN (input.c:1439 at tag 3.8).
+        if let ([b'#'], b'8') = (intermediates, b) {
+            self.screen.decaln();
+            return;
+        }
         if let Some(i) = intermediates.first() {
             self.callbacks.unhandled_escape(
                 &mut self.screen,
@@ -155,6 +359,7 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                 b'>' => self.screen.deckpnm(),
                 b'D' => self.screen.ind(),
                 b'E' => self.screen.nel(),
+                b'H' => self.screen.hts(),
                 b'M' => self.screen.ri(),
                 b'c' => self.screen.ris(),
                 b'g' => self.callbacks.visual_bell(&mut self.screen),
@@ -200,7 +405,8 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                 'D' => self.screen.cub(canonicalize_params_1(params, 1)),
                 'E' => self.screen.cnl(canonicalize_params_1(params, 1)),
                 'F' => self.screen.cpl(canonicalize_params_1(params, 1)),
-                'G' => self.screen.cha(canonicalize_params_1(params, 1)),
+                // HPA is CHA under another name (input.c:312, :324 at tag 3.8).
+                'G' | '`' => self.screen.cha(canonicalize_params_1(params, 1)),
                 'H' | 'f' => self.screen.cup(canonicalize_params_2(params, 1, 1)),
                 'J' => self
                     .screen
@@ -214,6 +420,9 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                 'S' => self.screen.su(canonicalize_params_1(params, 1)),
                 'T' => self.screen.sd(canonicalize_params_1(params, 1)),
                 'X' => self.screen.ech(canonicalize_params_1(params, 1)),
+                'Z' => self.screen.cbt(canonicalize_params_1(params, 1)),
+                // TBC reads 0 as itself, the stop at the cursor.
+                'g' => self.screen.tbc(canonicalize_params_1(params, 0)),
                 // REP: the last character printed, n more times
                 // (input.c:1799-1818 at tag 3.8). Each goes through `print`,
                 // as tmux adds each through screen_write_collect_add.
@@ -234,8 +443,8 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                     }
                 }
                 'd' => self.screen.vpa(canonicalize_params_1(params, 1)),
-                'h' => self.screen.sm(params, unhandled),
-                'l' => self.screen.rm(params, unhandled),
+                'h' => self.screen.sm(params, self.conhost_win10, unhandled),
+                'l' => self.screen.rm(params, self.conhost_win10, unhandled),
                 'm' => self.screen.sgr(params, unhandled),
                 'n' => {
                     // DSR (Device Status Report) — in passthrough mode the
@@ -353,6 +562,26 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
     fn osc_dispatch(&mut self, params: &[&[u8]], bel_terminated: bool) {
         self.last_printed = None;
         if let Some(query) = crate::queries::osc_query(params, self.screen.program_status_enabled(), bel_terminated) {
+            // The colours are the ones at this point of the stream, so a set
+            // just before the query is what it reports.
+            let query = match query {
+                crate::TerminalQuery::CursorColour { bel, .. } => crate::TerminalQuery::CursorColour {
+                    colour: self.screen.cursor_colour(),
+                    bel,
+                },
+                crate::TerminalQuery::ForegroundColour { bel, .. } => crate::TerminalQuery::ForegroundColour {
+                    colour: self.screen.default_foreground(),
+                    bel,
+                },
+                crate::TerminalQuery::BackgroundColour { bel, .. } => crate::TerminalQuery::BackgroundColour {
+                    colour: self.screen.default_background(),
+                    bel,
+                },
+                other => other,
+            };
+            if let (crate::TerminalQuery::Clipboard { .. }, [_, ty, _]) = (query, params) {
+                self.callbacks.paste_from_clipboard(&mut self.screen, ty);
+            }
             self.screen.query(query);
             return;
         }
@@ -384,22 +613,19 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
             // `bad = 1; break;`).  A `?` is a QUERY, taken in the order
             // written with the pane's own entry as it stands at that pair, so
             // a set before it in the same OSC is what it reports, as in tmux.
-            // psmux answers one of the sixteen ANSI colours from the outer
-            // terminal when the pane has no entry, and any other index only
-            // from the pane's entry; tmux asks the outer terminal for those
-            // (input_add_request, input.c:2956), psmux does not yet.  The
-            // answers go in stream order with the other queries (#473).
+            // With no entry, the host answers one of the sixteen ANSI colours
+            // from the outer terminal's values and any other index from the
+            // xterm 256 colour table, where tmux asks the outer terminal
+            // (input_add_request, input.c:2956).  The answers go in stream
+            // order with the other queries (#473).
             [b"4", rest @ ..] if !rest.is_empty() => {
                 for (idx, spec) in crate::queries::palette_pairs(rest) {
                     if spec == b"?" {
-                        let own = self.screen.palette_entry(idx);
-                        if crate::queries::is_palette_query(idx, spec, own) {
-                            self.screen.query(crate::TerminalQuery::PaletteColour {
-                                index: idx,
-                                own,
-                                bel: bel_terminated,
-                            });
-                        }
+                        self.screen.query(crate::TerminalQuery::PaletteColour {
+                            index: idx,
+                            own: self.screen.palette_entry(idx),
+                            bel: bel_terminated,
+                        });
                         continue;
                     }
                     if let Some(rgb) = crate::palette::parse_x11_colour(spec) {
@@ -408,6 +634,41 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                     // An unparseable colour is skipped, not fatal
                     // (input.c:2959 `s = next; continue;`).
                 }
+            }
+            // ---- OSC 12 / OSC 112 : the cursor colour ----
+            // tmux reads everything after `12;` as one colour
+            // (`input_osc_12`, input.c:3164 at tag 3.8), so a second `;` makes
+            // it unreadable and it is ignored, as is a colour psmux cannot
+            // parse. OSC 112 resets it only with nothing after it
+            // (`input_osc_112`, input.c:3189).
+            [b"12", spec] => {
+                if let Some(rgb) = crate::palette::parse_x11_colour(spec) {
+                    self.screen.set_program_cursor_colour(Some(rgb));
+                }
+            }
+            [b"112"] | [b"112", b""] => {
+                self.screen.set_program_cursor_colour(None);
+            }
+            // ---- OSC 10 / 11 and OSC 110 / 111 : the default colours ----
+            // Read as OSC 12 and OSC 112 are (`input_osc_10`, `input_osc_110`,
+            // `input_osc_11` and `input_osc_111`, input.c:3070, 3105, 3121 and
+            // 3148 at tag 3.8). They are the pane's own default foreground and
+            // background, under the styles' colours (see `StyleColour`).
+            [b"10", spec] => {
+                if let Some(rgb) = crate::palette::parse_x11_colour(spec) {
+                    self.screen.set_program_foreground(Some(rgb));
+                }
+            }
+            [b"11", spec] => {
+                if let Some(rgb) = crate::palette::parse_x11_colour(spec) {
+                    self.screen.set_program_background(Some(rgb));
+                }
+            }
+            [b"110"] | [b"110", b""] => {
+                self.screen.set_program_foreground(None);
+            }
+            [b"111"] | [b"111", b""] => {
+                self.screen.set_program_background(None);
             }
             // ---- OSC 104 : reset palette entries (issue #685) ----
             // Bare `\e]104\e\\` (and `\e]104;\e\\`, which vte hands us as an
@@ -428,20 +689,19 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
             [b"7", uri] => {
                 self.screen.set_path(uri);
             }
-            [b"9", b"4", state, progress] => {
-                // OSC 9;4 — Windows Terminal progress indicator.
+            [b"9", b"4", rest @ ..] => {
+                // OSC 9;4, the Windows Terminal progress indicator.
                 //   state: 0=hide, 1=default, 2=error, 3=indeterminate, 4=warning
-                //   progress: 0..=100
-                let s = std::str::from_utf8(state)
-                    .ok()
-                    .and_then(|s| s.parse::<u8>().ok())
-                    .unwrap_or(0);
-                let v = std::str::from_utf8(progress)
-                    .ok()
-                    .and_then(|s| s.parse::<u8>().ok())
-                    .unwrap_or(0);
-                self.screen.set_progress(s, v);
-                self.callbacks.set_progress(&mut self.screen, s, v);
+                //   progress: 0..=100, or nothing to keep the last one
+                match progress_fields(rest) {
+                    Some((state, value)) => {
+                        self.screen.set_progress(state, value);
+                        if let Some((s, v)) = self.screen.progress() {
+                            self.callbacks.set_progress(&mut self.screen, s, v);
+                        }
+                    }
+                    None => self.callbacks.unhandled_osc(&mut self.screen, params),
+                }
             }
             [b"9", b"9", cwd_rest @ ..] if !cwd_rest.is_empty() => {
                 // OSC 9;9;<cwd> — ConEmu's "set working directory", the form
@@ -484,14 +744,11 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                 self.screen.set_hyperlink(id_params, &uri);
             }
             [b"52", ty, data] => {
+                // `?` is a query, taken by `osc_query` above.
                 match (
                     ty.iter().all(|c| CLIPBOARD_SELECTOR.contains(c)),
                     *data,
                 ) {
-                    (true, b"?") => {
-                        self.callbacks
-                            .paste_from_clipboard(&mut self.screen, ty);
-                    }
                     // tmux parity: b64_pton skips ASCII whitespace anywhere
                     // in an OSC 52 payload, so producers that wrap long
                     // base64 must still get through this gate. The server
@@ -613,6 +870,11 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
         _ignore: bool,
         action: char,
     ) {
+        // `ESC P tmux;`: the final byte is the `t`, `mux;` comes to `put`.
+        // tmux looks only at the data, whatever came before it
+        // (input_dcs_dispatch, input.c:2675). Every mode skips the body;
+        // on/all additionally collect it for raw host delivery.
+        self.tmux_prefix = u8::from(action == 't');
         // Sixel is DCS with final byte 'q' and NO intermediates.  DECRQSS also
         // ends in 'q' but carries the '$' (0x24) intermediate, so gating on an
         // empty intermediates slice keeps DECRQSS (and all other DCS) untouched.
@@ -642,7 +904,18 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
         // Any other DCS: no-op (do NOT set active, do NOT route anywhere).
     }
 
+    fn terminated(&self) -> bool {
+        self.tmux_prefix == 5
+    }
+
     fn put(&mut self, byte: u8) {
+        if (1..5).contains(&self.tmux_prefix) {
+            self.tmux_prefix = if b"mux;"[usize::from(self.tmux_prefix - 1)] == byte {
+                self.tmux_prefix + 1
+            } else {
+                0
+            };
+        }
         if self.dcs_active {
             if self.dcs_buf.len() >= input_buffer_size() {
                 self.dcs_active = false;
@@ -655,6 +928,7 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
 
     fn unhook(&mut self) {
         self.last_printed = None;
+        self.tmux_prefix = 0;
         if !self.dcs_active {
             return;
         }
@@ -706,6 +980,36 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
         // Let go of the image's bytes rather than keep the capacity.
         self.dcs_buf = Vec::new();
     }
+}
+
+/// The fields of an OSC 9;4 after the `4`, read as tmux's `input_osc_9` reads
+/// them (input.c:3030 at tag 3.8): one digit from 0 to 4 for the state, then a
+/// value of at most 100, or nothing with or without its `;`. tmux ignores
+/// anything else and so does this, leaving the indicator as it was.
+fn progress_fields(rest: &[&[u8]]) -> Option<(u8, Option<u8>)> {
+    let (state, value) = match rest {
+        [state] | [state, b""] => (*state, None),
+        [state, value] => (*state, Some(*value)),
+        _ => return None,
+    };
+    let state = match state {
+        [digit @ b'0'..=b'4'] => digit - b'0',
+        _ => return None,
+    };
+    let Some(digits) = value else {
+        return Some((state, None));
+    };
+    let mut number: u16 = 0;
+    for byte in digits {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        number = number * 10 + u16::from(byte - b'0');
+        if number > 100 {
+            return None;
+        }
+    }
+    Some((state, u8::try_from(number).ok()))
 }
 
 /// Where a sixel lands and where it leaves the text cursor, in the units the
@@ -1216,3 +1520,15 @@ fn canonicalize_params_decstbm(
 #[cfg(test)]
 #[path = "../../../tests-rs/test_issue431_sixel_parse.rs"]
 mod test_issue431_sixel_parse;
+
+#[cfg(test)]
+#[path = "../../../tests-rs/test_issue972_conhost_c0_cells.rs"]
+mod test_issue972_conhost_c0_cells;
+
+#[cfg(test)]
+#[path = "../../../tests-rs/test_issue972_conhost_dcs_body.rs"]
+mod test_issue972_conhost_dcs_body;
+
+#[cfg(test)]
+#[path = "../../../tests-rs/test_conhost_win10.rs"]
+mod test_conhost_win10;
